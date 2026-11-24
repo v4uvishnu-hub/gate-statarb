@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 import pandas as pd
 import ccxt.async_support as ccxt
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -25,9 +25,11 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 NOTIONAL_USDT = float(os.getenv("NOTIONAL_USDT", "100"))
 SIM_START_EQUITY = float(os.getenv("SIM_START_EQUITY", "1000"))
-TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0005"))  # 0.05% Gate.io futures taker
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "45"))
+TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0005"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+GATE_FUTURES_BASE = "https://api.gateio.ws/api/v4/futures/usdt"
 
 engine = StatArbEngine(
     lookback=int(os.getenv("LOOKBACK", "100")),
@@ -38,21 +40,27 @@ engine = StatArbEngine(
 
 state = {
     "running": True,
+    "scan_status": "Initializing...",
+    "last_scan_sec": 0.0,
     "universe_count": 0,
+    "ready_count": 0,
     "active_pair_y": "ETH/USDT:USDT",
     "active_pair_x": "BTC/USDT:USDT",
-    "positions": [],       # Up to MAX_POSITIONS active dicts
+    "positions": [],
     "unrealized_pnl": 0.0,
     "sim_equity": SIM_START_EQUITY,
     "realized_pnl": 0.0,
     "wins": 0,
     "losses": 0,
-    "trades": [],          # Completed simulated/live trades
-    "top_pairs": [],       # Top screened cointegrated pairs
+    "trades": [],
+    "top_pairs": [],
     "metrics": {},
     "updated_at": None,
     "events": [],
 }
+
+# Candle cache: contract_name -> pd.DataFrame
+candle_cache: dict[str, pd.DataFrame] = {}
 
 
 def add_event(msg: str):
@@ -70,6 +78,12 @@ def make_exchange():
         cfg["apiKey"] = GATE_API_KEY
         cfg["secret"] = GATE_API_SECRET
     return ccxt.gate(cfg)
+
+
+def to_gate_contract(ccxt_symbol: str) -> str:
+    # "ETH/USDT:USDT" -> "ETH_USDT"
+    base = ccxt_symbol.split("/")[0]
+    return f"{base}_USDT"
 
 
 def auth(update: Update) -> bool:
@@ -108,35 +122,64 @@ def busy_symbols() -> set[str]:
     return used
 
 
-async def get_top_usdt_swaps(ex, limit: int = 100) -> list[str]:
-    tickers = await ex.fetch_tickers()
+async def fetch_top_usdt_contracts(session: ClientSession, limit: int = 100) -> list[str]:
+    """Single HTTP GET to Gate.io futures tickers — returns top 100 symbols in <0.5s."""
+    url = f"{GATE_FUTURES_BASE}/tickers"
+    async with session.get(url) as resp:
+        data = await resp.json()
     ranked = []
-    for sym, t in tickers.items():
-        mkt = ex.markets.get(sym)
-        if not mkt or not mkt.get("swap") or mkt.get("quote") != "USDT" or not mkt.get("active", True):
+    for item in data:
+        contract = item.get("contract", "")
+        if not contract.endswith("_USDT"):
             continue
-        vol = float(t.get("quoteVolume") or 0.0)
+        vol = float(item.get("volume_24h_settle") or item.get("volume_24h_quote") or 0.0)
         if vol > 0:
-            ranked.append((vol, sym))
+            base = contract[:-5]
+            ranked.append((vol, f"{base}/USDT:USDT"))
     ranked.sort(reverse=True)
     return [sym for _, sym in ranked[:limit]]
 
 
-async def fetch_ohlcv_universe(ex, symbols: list[str]) -> dict[str, pd.DataFrame]:
-    sem = asyncio.Semaphore(10)
-    out: dict[str, pd.DataFrame] = {}
+async def fetch_candles_fast(session: ClientSession, symbols: list[str]) -> dict[str, pd.DataFrame]:
+    """
+    Fetches candles concurrently via aiohttp without CCXT global lock bottlenecks.
+    Fetches 115 candles on cold cache, and only the latest 6 candles on warm cache.
+    """
+    sem = asyncio.Semaphore(16)
+    needed = engine.lookback + 15
 
     async def worker(sym: str):
+        contract = to_gate_contract(sym)
+        cached = candle_cache.get(sym)
+        fetch_limit = 6 if (cached is not None and len(cached) >= needed) else needed
+        url = f"{GATE_FUTURES_BASE}/candlesticks?contract={contract}&interval={TIMEFRAME}&limit={fetch_limit}"
+
         async with sem:
             try:
-                rows = await ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=engine.lookback + 10)
-                if rows and len(rows) >= engine.lookback:
-                    out[sym] = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return
+                    rows = await resp.json()
+                    if not rows:
+                        return
+                    new_df = pd.DataFrame([
+                        {
+                            "ts": int(r["t"]),
+                            "close": float(r["c"]),
+                        }
+                        for r in rows
+                    ])
+                    if cached is not None and fetch_limit < needed:
+                        merged = pd.concat([cached, new_df], ignore_index=True)
+                        merged = merged.drop_duplicates(subset=["ts"], keep="last").sort_values("ts").tail(needed)
+                        candle_cache[sym] = merged.reset_index(drop=True)
+                    else:
+                        candle_cache[sym] = new_df.sort_values("ts").tail(needed).reset_index(drop=True)
             except Exception:
                 pass
 
     await asyncio.gather(*(worker(s) for s in symbols))
-    return out
+    return {s: candle_cache[s] for s in symbols if s in candle_cache and len(candle_cache[s]) >= engine.lookback}
 
 
 async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict:
@@ -244,6 +287,8 @@ DASHBOARD_HTML = """<!doctype html>
     .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
     .live { background: #065f46; color: #6ee7b7; }
     .dry { background: #1e3a8a; color: #93c5fd; }
+    .ready-pill { background: #065f46; color: #6ee7b7; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+    .watch-pill { background: #334155; color: #cbd5e1; padding: 2px 7px; border-radius: 6px; font-size: 11px; }
     .controls { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
     button { border: 1px solid #334155; background: #1e293b; color: #f8fafc; padding: 9px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }
     button:hover:not(:disabled) { background: #334155; }
@@ -272,8 +317,8 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="wrap">
   <div class="top">
     <div>
-      <h2 style="margin:0">Gate.io Top-100 Stat-Arb (Max 3 Pairs)</h2>
-      <small id="pair" style="color:#94a3b8">Scanning top 100 coins...</small>
+      <h2 style="margin:0">Gate.io Top-100 Stat-Arb (Auto-Entry)</h2>
+      <small id="pair" style="color:#94a3b8">Initializing fast scan...</small>
     </div>
     <span id="mode" class="badge dry">SIMULATOR</span>
   </div>
@@ -286,9 +331,9 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">Sim Equity (USDT)</div><div class="val" id="eq">1000.00</div></div>
     <div class="card"><div class="label">Realized / Unrealized</div><div class="val" id="pnl">0.00 / 0.00</div></div>
     <div class="card"><div class="label">Open Pairs</div><div class="val" id="openCount">0 / 3</div></div>
-    <div class="card"><div class="label">Focus Z-Score</div><div class="val" id="z">-</div></div>
+    <div class="card"><div class="label">Entry-Ready Pairs</div><div class="val" id="readyCount">0</div></div>
     <div class="card"><div class="label">Win / Loss</div><div class="val" id="wl">0 / 0</div></div>
-    <div class="card"><div class="label">Universe Scanned</div><div class="val" id="univ">0</div></div>
+    <div class="card"><div class="label">Scan Speed</div><div class="val" id="univ">-</div></div>
   </div>
   <svg id="chart" viewBox="0 0 600 125" preserveAspectRatio="none"></svg>
 
@@ -300,10 +345,10 @@ DASHBOARD_HTML = """<!doctype html>
 
   <div class="cols">
     <div>
-      <h4 style="margin:0 0 8px 0;color:#94a3b8">Top Cointegrated Pairs (Top 100 Scan)</h4>
+      <h4 style="margin:0 0 8px 0;color:#94a3b8">Top Ranked Pairs (Entry Criteria Sorted)</h4>
       <table>
-        <thead><tr><th>Pair</th><th>Z</th><th>Beta</th><th>ADF</th><th>HL</th></tr></thead>
-        <tbody id="topPairs"><tr><td colspan="5">Scanning...</td></tr></tbody>
+        <thead><tr><th>Pair</th><th>Status</th><th>Z</th><th>Beta</th><th>ADF</th><th>HL</th></tr></thead>
+        <tbody id="topPairs"><tr><td colspan="6">Scanning...</td></tr></tbody>
       </table>
     </div>
     <div>
@@ -316,7 +361,7 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 
   <h4 style="margin:0 0 8px 0;color:#94a3b8">Recent Activity</h4>
-  <ul id="events"><li>Initializing top-100 market scan...</li></ul>
+  <ul id="events"><li>Starting fast scan...</li></ul>
 </div>
 <script>
 function fmtPnl(v) {
@@ -339,21 +384,21 @@ function drawChart(pts, entry) {
 }
 function applyState(s) {
   const posList = s.positions || [];
-  document.getElementById('pair').textContent = `Focus: ${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.running ? 'RUNNING' : 'PAUSED'}`;
+  document.getElementById('pair').textContent = `Focus: ${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.scan_status}`;
   const badge = document.getElementById('mode');
   badge.textContent = s.dry_run ? 'SIMULATED PAPER' : 'LIVE TRADING';
   badge.className = 'badge ' + (s.dry_run ? 'dry' : 'live');
   document.getElementById('eq').textContent = s.sim_equity.toFixed(2);
   document.getElementById('pnl').innerHTML = `${fmtPnl(s.realized_pnl)} / ${fmtPnl(s.unrealized_pnl)}`;
   document.getElementById('openCount').textContent = `${posList.length} / ${s.max_positions}`;
+  document.getElementById('readyCount').textContent = `${s.ready_count} ready`;
   document.getElementById('wl').textContent = `${s.wins} / ${s.losses}`;
-  document.getElementById('univ').textContent = `${s.universe_count} coins`;
+  document.getElementById('univ').textContent = `${s.universe_count}c / ${s.last_scan_sec}s`;
   document.getElementById('btnPause').disabled = !s.running;
   document.getElementById('btnResume').disabled = s.running;
   document.getElementById('btnClose').disabled = posList.length === 0;
 
-  if (s.metrics && s.metrics.z_score !== undefined) {
-    document.getElementById('z').textContent = `${s.metrics.z_score.toFixed(2)} (±${s.z_entry.toFixed(1)})`;
+  if (s.metrics && s.metrics.z_history) {
     drawChart(s.metrics.z_history, s.z_entry);
   }
   document.getElementById('openPos').innerHTML = posList.length
@@ -361,9 +406,12 @@ function applyState(s) {
     : '<tr><td colspan="6">No open positions</td></tr>';
 
   if (s.top_pairs && s.top_pairs.length) {
-    document.getElementById('topPairs').innerHTML = s.top_pairs.map(p =>
-      `<tr><td>${p.pair_y.split('/')[0]}/${p.pair_x.split('/')[0]}</td><td>${p.z_score.toFixed(2)}</td><td>${p.beta.toFixed(2)}</td><td>${p.adf_stat.toFixed(2)}</td><td>${p.half_life.toFixed(0)}b</td></tr>`
-    ).join('');
+    document.getElementById('topPairs').innerHTML = s.top_pairs.map(p => {
+      const tag = p.entry_ready
+        ? '<span class="ready-pill">ENTRY MET</span>'
+        : (p.is_cointegrated ? '<span class="watch-pill">COINT</span>' : '<span class="watch-pill">WATCH</span>');
+      return `<tr><td>${p.pair_y.split('/')[0]}/${p.pair_x.split('/')[0]}</td><td>${tag}</td><td>${p.z_score.toFixed(2)}</td><td>${p.beta.toFixed(2)}</td><td>${p.adf_stat.toFixed(2)}</td><td>${p.half_life.toFixed(0)}b</td></tr>`;
+    }).join('');
   }
   if (s.trades && s.trades.length) {
     document.getElementById('trades').innerHTML = s.trades.map(t =>
@@ -392,7 +440,7 @@ async function refresh() {
   } catch (e) {}
 }
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh, 4000);
 </script>
 </body>
 </html>"""
@@ -401,8 +449,11 @@ setInterval(refresh, 5000);
 def snapshot_state() -> dict:
     return {
         "running": state["running"],
+        "scan_status": state["scan_status"],
+        "last_scan_sec": state["last_scan_sec"],
         "dry_run": DRY_RUN,
         "universe_count": state["universe_count"],
+        "ready_count": state["ready_count"],
         "max_positions": MAX_POSITIONS,
         "pair_y": state["active_pair_y"],
         "pair_x": state["active_pair_x"],
@@ -415,7 +466,7 @@ def snapshot_state() -> dict:
         "wins": state["wins"],
         "losses": state["losses"],
         "trades": state["trades"][:12],
-        "top_pairs": state["top_pairs"][:8],
+        "top_pairs": state["top_pairs"][:10],
         "metrics": state["metrics"],
         "updated_at": state["updated_at"],
         "events": state["events"],
@@ -483,9 +534,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in state["positions"]
     ]
     pos_block = "\n".join(pos_lines) if pos_lines else "None (FLAT)"
-    z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | ADF: {m['adf_stat']:.2f}" if m else "Scanning..."
+    z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | ADF: {m['adf_stat']:.2f}" if m else state["scan_status"]
     await update.message.reply_text(
         f"Mode: {'SIMULATOR' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'}\n"
+        f"Scan: {state['universe_count']} coins in {state['last_scan_sec']}s ({state['ready_count']} entry-ready)\n"
         f"Open Pairs: {len(state['positions'])}/{MAX_POSITIONS} | Total uPnL: {state['unrealized_pnl']:+.2f} USDT\n"
         f"Focus ({state['active_pair_y'].split('/')[0]}/{state['active_pair_x'].split('/')[0]}): {z_txt}\n"
         f"Positions:\n{pos_block}"
@@ -509,15 +561,16 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
-    pairs = state["top_pairs"][:6]
+    pairs = state["top_pairs"][:8]
     if not pairs:
-        await update.message.reply_text("Top-100 scan still running...")
+        await update.message.reply_text(f"Scan status: {state['scan_status']}")
         return
-    lines = ["Top Cointegrated Pairs (Top 100 Scan):"]
+    lines = [f"Top Ranked Pairs ({state['ready_count']} Entry-Ready):"]
     for p in pairs:
         y_n = p["pair_y"].split("/")[0]
         x_n = p["pair_x"].split("/")[0]
-        lines.append(f"• {y_n}/{x_n}: Z={p['z_score']:+.2f} | ADF={p['adf_stat']:.2f} | HL={p['half_life']:.0f}b")
+        tag = "[ENTRY]" if p.get("entry_ready") else ("[COINT]" if p.get("is_cointegrated") else "[WATCH]")
+        lines.append(f"• {tag} {y_n}/{x_n}: Z={p['z_score']:+.2f} | ADF={p['adf_stat']:.2f} | HL={p['half_life']:.0f}b")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -602,10 +655,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
     await update.message.reply_text(
-        f"Commands (Max {MAX_POSITIONS} simultaneous pairs):\n"
+        f"Commands (Auto-selecting top coins, max {MAX_POSITIONS} pairs):\n"
         "/status - Open positions, Z-score, unrealized PnL\n"
         "/pnl - Simulated equity, realized PnL, win/loss stats\n"
-        "/top - Top cointegrated pairs from Top-100 scan\n"
+        "/top - Top entry-ready & cointegrated pairs\n"
         "/trades - Recent simulated trade history\n"
         "/balance - Gate.io live USDT futures balance\n"
         "/setz <val> - Set Z-score entry threshold\n"
@@ -623,97 +676,115 @@ async def tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error(f"Telegram error: {context.error}", exc_info=context.error)
 
 
-# ---------------- Multi-Pair Top-100 Trading Loop ----------------
+# ---------------- Fast Top-100 Auto-Selection Trading Loop ----------------
 
 async def trader_loop(tg_app: Application):
     ex = make_exchange()
     await ex.load_markets()
-    top_symbols = await get_top_usdt_swaps(ex, TOP_N_COINS)
-    state["universe_count"] = len(top_symbols)
-    add_event(f"Loaded Top {len(top_symbols)} Gate.io USDT Perpetuals (Max {MAX_POSITIONS} pairs)")
+    timeout = ClientTimeout(total=12)
+    top_symbols: list[str] = []
     cycle = 0
 
     try:
-        while True:
-            try:
-                if cycle > 0 and cycle % 20 == 0:
-                    top_symbols = await get_top_usdt_swaps(ex, TOP_N_COINS)
-                    state["universe_count"] = len(top_symbols)
-                cycle += 1
+        async with ClientSession(timeout=timeout) as session:
+            while True:
+                t0 = asyncio.get_running_loop().time()
+                try:
+                    if not top_symbols or cycle % 20 == 0:
+                        state["scan_status"] = "Fetching Top 100 tickers..."
+                        top_symbols = await fetch_top_usdt_contracts(session, TOP_N_COINS)
+                        state["universe_count"] = len(top_symbols)
+                    cycle += 1
 
-                ohlcv_map = await fetch_ohlcv_universe(ex, top_symbols)
-                ranked_pairs = engine.scan_universe(ohlcv_map, anchor_count=8)
-                state["top_pairs"] = ranked_pairs[:15]
-                state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    state["scan_status"] = f"Fetching {len(top_symbols)} candles..."
+                    ohlcv_map = await fetch_candles_fast(session, top_symbols)
 
-                # 1. Evaluate & update all open positions
-                for pos in list(state["positions"]):
-                    py, px = pos["pair_y"], pos["pair_x"]
-                    if py in ohlcv_map and px in ohlcv_map:
-                        m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
-                        pos["current_z"] = round(m["z_score"], 2)
-                        pos["current_y"] = m["price_y"]
-                        pos["current_x"] = m["price_x"]
-                        pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, m["price_y"], m["price_x"]), 3)
+                    state["scan_status"] = "Scoring cointegration..."
+                    ranked_pairs = await asyncio.to_thread(engine.scan_universe, ohlcv_map, 8)
 
-                        if state["running"] and engine.get_signal(m, pos["side"]) == "CLOSE":
-                            reason = "STOP_LOSS" if abs(m["z_score"]) >= engine.z_stop else "MEAN_REVERT"
-                            tr = await close_single_position(
-                                ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason
-                            )
-                            msg = (
-                                f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']})\n"
-                                f"Z: {tr['entry_z']} → {tr['exit_z']} | Net PnL: {tr['pnl']:+.2f} USDT\n"
-                                f"Sim Equity: {state['sim_equity']:.2f} USDT"
-                            )
-                            add_event(f"CLOSED {tr['pair']} {tr['pnl']:+.2f} USDT ({reason})")
-                            await tg_app.bot.send_message(ADMIN_ID, msg)
+                    elapsed = round(asyncio.get_running_loop().time() - t0, 1)
+                    state["last_scan_sec"] = elapsed
+                    state["top_pairs"] = ranked_pairs[:15]
+                    state["ready_count"] = sum(1 for r in ranked_pairs if r.get("entry_ready"))
+                    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    state["scan_status"] = f"{'ACTIVE' if state['running'] else 'PAUSED'} • Scanned in {elapsed}s"
 
-                refresh_unrealized_pnl(ohlcv_map)
+                    if cycle == 1:
+                        add_event(
+                            f"Initial scan finished in {elapsed}s ({len(ohlcv_map)} coins, {state['ready_count']} entry-ready)"
+                        )
 
-                # 2. Update chart focus (first open pair or top ranked pair)
-                if state["positions"]:
-                    focus = state["positions"][0]
-                    py, px = focus["pair_y"], focus["pair_x"]
-                    state["active_pair_y"], state["active_pair_x"] = py, px
-                    if py in ohlcv_map and px in ohlcv_map:
-                        state["metrics"] = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
-                elif ranked_pairs:
-                    best = ranked_pairs[0]
-                    state["active_pair_y"], state["active_pair_x"] = best["pair_y"], best["pair_x"]
-                    state["metrics"] = best
+                    # 1. Manage existing open positions
+                    for pos in list(state["positions"]):
+                        py, px = pos["pair_y"], pos["pair_x"]
+                        if py in ohlcv_map and px in ohlcv_map:
+                            m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
+                            pos["current_z"] = round(m["z_score"], 2)
+                            pos["current_y"] = m["price_y"]
+                            pos["current_x"] = m["price_x"]
+                            pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, m["price_y"], m["price_x"]), 3)
 
-                # 3. Open new positions up to MAX_POSITIONS (3) without overlapping symbols
-                if state["running"] and len(state["positions"]) < MAX_POSITIONS:
-                    used = busy_symbols()
-                    for cand in ranked_pairs:
-                        if len(state["positions"]) >= MAX_POSITIONS:
-                            break
-                        if cand["pair_y"] in used or cand["pair_x"] in used:
-                            continue
-                        sig = engine.get_signal(cand, None)
-                        if sig in ("LONG_SPREAD", "SHORT_SPREAD"):
-                            pos_rec = await open_spread(
-                                ex, cand["pair_y"], cand["pair_x"], sig, cand
-                            )
-                            used.add(cand["pair_y"])
-                            used.add(cand["pair_x"])
-                            state["active_pair_y"], state["active_pair_x"] = cand["pair_y"], cand["pair_x"]
-                            state["metrics"] = cand
-                            msg = (
-                                f"[SIM OPENED {len(state['positions'])}/{MAX_POSITIONS}] {sig} on {pos_rec['label']}\n"
-                                f"Z: {cand['z_score']:+.2f} | Beta: {cand['beta']:.3f} | ADF: {cand['adf_stat']:.2f}\n"
-                                f"{pos_rec['side_y'].upper()} {pos_rec['qty_y']} {cand['pair_y']} @ {cand['price_y']}\n"
-                                f"{pos_rec['side_x'].upper()} {pos_rec['qty_x']} {cand['pair_x']} @ {cand['price_x']}"
-                            )
-                            add_event(f"OPENED {sig} {pos_rec['label']} @ Z={cand['z_score']:+.2f}")
-                            await tg_app.bot.send_message(ADMIN_ID, msg)
+                            if state["running"] and engine.get_signal(m, pos["side"]) == "CLOSE":
+                                reason = "STOP_LOSS" if abs(m["z_score"]) >= engine.z_stop else "MEAN_REVERT"
+                                tr = await close_single_position(
+                                    ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason
+                                )
+                                msg = (
+                                    f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']})\n"
+                                    f"Z: {tr['entry_z']} → {tr['exit_z']} | Net PnL: {tr['pnl']:+.2f} USDT\n"
+                                    f"Sim Equity: {state['sim_equity']:.2f} USDT"
+                                )
+                                add_event(f"CLOSED {tr['pair']} {tr['pnl']:+.2f} USDT ({reason})")
+                                await tg_app.bot.send_message(ADMIN_ID, msg)
 
-            except Exception as e:
-                log.error(f"Loop error: {e}", exc_info=True)
-                add_event(f"Loop error: {e}")
+                    refresh_unrealized_pnl(ohlcv_map)
 
-            await asyncio.sleep(POLL_SECONDS)
+                    # 2. Update chart focus
+                    if state["positions"]:
+                        focus = state["positions"][0]
+                        py, px = focus["pair_y"], focus["pair_x"]
+                        state["active_pair_y"], state["active_pair_x"] = py, px
+                        if py in ohlcv_map and px in ohlcv_map:
+                            state["metrics"] = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
+                    elif ranked_pairs:
+                        best = ranked_pairs[0]
+                        state["active_pair_y"], state["active_pair_x"] = best["pair_y"], best["pair_x"]
+                        state["metrics"] = best
+
+                    # 3. Auto-select & enter top cointegrated pairs meeting entry Z-score
+                    if state["running"] and len(state["positions"]) < MAX_POSITIONS:
+                        used = busy_symbols()
+                        for cand in ranked_pairs:
+                            if len(state["positions"]) >= MAX_POSITIONS:
+                                break
+                            if not cand.get("entry_ready"):
+                                break
+                            if cand["pair_y"] in used or cand["pair_x"] in used:
+                                continue
+                            sig = engine.get_signal(cand, None)
+                            if sig in ("LONG_SPREAD", "SHORT_SPREAD"):
+                                pos_rec = await open_spread(
+                                    ex, cand["pair_y"], cand["pair_x"], sig, cand
+                                )
+                                used.add(cand["pair_y"])
+                                used.add(cand["pair_x"])
+                                state["active_pair_y"], state["active_pair_x"] = cand["pair_y"], cand["pair_x"]
+                                state["metrics"] = cand
+                                msg = (
+                                    f"[AUTO ENTRY {len(state['positions'])}/{MAX_POSITIONS}] {sig} on {pos_rec['label']}\n"
+                                    f"Z: {cand['z_score']:+.2f} | Beta: {cand['beta']:.3f} | ADF: {cand['adf_stat']:.2f} | HL: {cand['half_life']:.0f}b\n"
+                                    f"{pos_rec['side_y'].upper()} {pos_rec['qty_y']} {cand['pair_y']} @ {cand['price_y']}\n"
+                                    f"{pos_rec['side_x'].upper()} {pos_rec['qty_x']} {cand['pair_x']} @ {cand['price_x']}"
+                                )
+                                add_event(f"AUTO OPENED {sig} {pos_rec['label']} @ Z={cand['z_score']:+.2f}")
+                                await tg_app.bot.send_message(ADMIN_ID, msg)
+
+                except Exception as e:
+                    log.error(f"Loop error: {e}", exc_info=True)
+                    state["scan_status"] = f"Error: {e}"
+                    add_event(f"Loop error: {e}")
+
+                await asyncio.sleep(POLL_SECONDS)
     finally:
         await ex.close()
 
