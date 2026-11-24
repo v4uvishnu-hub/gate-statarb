@@ -25,6 +25,7 @@ PORT = int(os.getenv("PORT", "3000"))
 
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "720"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 NOTIONAL_USDT = float(os.getenv("NOTIONAL_USDT", "100"))
 SIM_START_EQUITY = float(os.getenv("SIM_START_EQUITY", "1000"))
@@ -32,7 +33,6 @@ TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0005"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-# State persistence options
 PERSIST_STATE = os.getenv("PERSIST_STATE", "true").lower() == "true"
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
@@ -44,6 +44,8 @@ engine = StatArbEngine(
     z_entry=float(os.getenv("Z_ENTRY", "2.0")),
     z_exit=float(os.getenv("Z_EXIT", "0.2")),
     z_stop=float(os.getenv("Z_STOP", "3.8")),
+    notional_usdt=NOTIONAL_USDT,
+    round_trip_fee_rate=TAKER_FEE_RATE * 4.0,
 )
 
 state = {
@@ -176,18 +178,62 @@ def leg_unrealized_pnl(pos: dict, price_y: float, price_x: float) -> float:
     return float(pnl_y + pnl_x)
 
 
-def refresh_unrealized_pnl(ohlcv_map: dict[str, pd.DataFrame]):
+def compute_position_live_edge(pos: dict, m: dict, cy: float, cx: float) -> tuple[float, float]:
+    """Remaining expected edge (%) and USDT toward z_exit net of exit fees."""
+    z_now = float(m["z_score"])
+    spread_std = float(m.get("spread_std") or 0.01)
+    if pos["side"] == "LONG_SPREAD":
+        revert_z = max(0.0, (-engine.z_exit) - z_now)
+    else:
+        revert_z = max(0.0, z_now - engine.z_exit)
+    gross_pct = (np.exp(min(revert_z * spread_std, 1.0)) - 1.0) * 100.0
+    exit_fee_pct = TAKER_FEE_RATE * 2.0 * 100.0
+    edge_pct = float(gross_pct - exit_fee_pct)
+    notional_now = pos["qty_y"] * cy + pos["qty_x"] * cx
+    edge_usdt = float((edge_pct / 100.0) * notional_now)
+    return round(edge_pct, 3), round(edge_usdt, 3)
+
+
+def enrich_position_timers():
+    now_ts = now_ist().timestamp()
+    max_sec = max(60, MAX_HOLD_MINUTES * 60)
+    for pos in state["positions"]:
+        entry_ts = float(pos.get("entry_ts") or now_ts)
+        pos["entry_ts"] = entry_ts
+        pos["max_hold_min"] = MAX_HOLD_MINUTES
+        elapsed_sec = max(0.0, now_ts - entry_ts)
+        rem_sec = max(0.0, max_sec - elapsed_sec)
+        pos["remaining_sec"] = int(rem_sec)
+        pos["remaining_pct"] = round(min(100.0, max(0.0, (rem_sec / max_sec) * 100.0)), 1)
+
+
+def is_expired(pos: dict) -> bool:
+    enrich_position_timers()
+    return pos.get("remaining_sec", 1) <= 0
+
+
+def refresh_positions_from_ohlcv(ohlcv_map: dict[str, pd.DataFrame]):
     total_u = 0.0
     for pos in state["positions"]:
         py, px = pos["pair_y"], pos["pair_x"]
         if py in ohlcv_map and px in ohlcv_map:
+            m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
             cy = float(ohlcv_map[py]["close"].iloc[-1])
             cx = float(ohlcv_map[px]["close"].iloc[-1])
             pos["current_y"] = cy
             pos["current_x"] = cx
+            pos["current_z"] = round(m["z_score"], 2)
+            pos["beta"] = round(m["beta"], 3)
+            pos["adf_stat"] = round(m["adf_stat"], 2)
+            pos["half_life"] = round(m["half_life"], 1)
+            pos["corr"] = round(m["corr"], 2)
+            e_pct, e_usdt = compute_position_live_edge(pos, m, cy, cx)
+            pos["edge_pct"] = e_pct
+            pos["edge_usdt"] = e_usdt
             pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, cy, cx), 3)
         total_u += float(pos.get("unrealized_pnl", 0.0))
     state["unrealized_pnl"] = float(total_u)
+    enrich_position_timers()
 
 
 def busy_symbols() -> set[str]:
@@ -286,6 +332,7 @@ async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict |
     state["sim_equity"] -= entry_fee
     state["realized_pnl"] -= entry_fee
 
+    now_dt = now_ist()
     pos_rec = {
         "pair_y": pair_y,
         "pair_x": pair_x,
@@ -301,8 +348,18 @@ async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict |
         "current_x": m["price_x"],
         "entry_z": round(m["z_score"], 2),
         "current_z": round(m["z_score"], 2),
+        "beta": round(m["beta"], 3),
+        "adf_stat": round(m["adf_stat"], 2),
+        "half_life": round(m["half_life"], 1),
+        "corr": round(m["corr"], 2),
+        "edge_pct": m.get("edge_pct", 0.0),
+        "edge_usdt": m.get("edge_usdt", 0.0),
         "unrealized_pnl": 0.0,
-        "entry_time": now_ist().strftime("%d-%m %H:%M IST"),
+        "entry_ts": now_dt.timestamp(),
+        "max_hold_min": MAX_HOLD_MINUTES,
+        "remaining_sec": MAX_HOLD_MINUTES * 60,
+        "remaining_pct": 100.0,
+        "entry_time": now_dt.strftime("%d-%m %H:%M IST"),
     }
     state["positions"].append(pos_rec)
     state["active_pair_y"] = pair_y
@@ -343,6 +400,7 @@ async def close_single_position(ex, pos: dict, price_y: float | None = None, pri
         "side": pos["side"],
         "entry_z": pos["entry_z"],
         "exit_z": round(exit_z if exit_z else pos.get("current_z", 0.0), 2),
+        "edge_pct": pos.get("edge_pct", 0.0),
         "pnl": round(net_pnl, 3),
         "reason": reason,
     }
@@ -374,7 +432,7 @@ DASHBOARD_HTML = """<!doctype html>
   <title>Gate.io Top-100 Stat-Arb Simulator (IST)</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-    .wrap { max-width: 1080px; margin: 0 auto; }
+    .wrap { max-width: 1240px; margin: 0 auto; }
     .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 12px; flex-wrap: wrap; }
     .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
     .live { background: #065f46; color: #6ee7b7; }
@@ -396,14 +454,18 @@ DASHBOARD_HTML = """<!doctype html>
     .val { font-size: 20px; font-weight: 700; }
     .pos-green { color: #4ade80; }
     .neg-red { color: #f87171; }
-    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 18px; }
-    @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } .status-meta { margin-left: 0; } }
-    table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; font-size: 13px; border: 1px solid #334155; margin-bottom: 16px; }
-    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #334155; }
+    .rem-box { min-width: 135px; }
+    .rem-text { font-family: monospace; font-size: 11px; color: #cbd5e1; margin-bottom: 4px; display: flex; justify-content: space-between; }
+    .rem-track { width: 100%; height: 8px; background: #0f172a; border-radius: 999px; overflow: hidden; border: 1px solid #334155; }
+    .rem-fill { height: 100%; border-radius: 999px; transition: width 0.5s linear, background-color 0.3s ease; }
+    .table-wrap { overflow-x: auto; margin-bottom: 16px; border-radius: 10px; border: 1px solid #334155; background: #1e293b; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+    th, td { padding: 8px 9px; text-align: left; border-bottom: 1px solid #334155; vertical-align: middle; }
     th { color: #94a3b8; font-weight: 600; background: #162032; }
     ul { list-style: none; padding: 12px; margin: 0; background: #1e293b; border-radius: 10px; border: 1px solid #334155; font-family: monospace; font-size: 12px; max-height: 210px; overflow-y: auto; }
     li { padding: 4px 0; border-bottom: 1px solid #334155; }
     li:last-child { border-bottom: none; }
+    @media (max-width: 820px) { .status-meta { margin-left: 0; } }
   </style>
 </head>
 <body>
@@ -433,27 +495,39 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">Scan Speed</div><div class="val" id="univ">-</div></div>
   </div>
 
-  <h4 style="margin:0 0 8px 0;color:#94a3b8">Open Positions</h4>
-  <table>
-    <thead><tr><th>Pair</th><th>Side</th><th>Entry Z</th><th>Now Z</th><th>Unrealized ($)</th><th>Opened (IST)</th></tr></thead>
-    <tbody id="openPos"><tr><td colspan="6">No open positions</td></tr></tbody>
-  </table>
+  <h4 style="margin:0 0 8px 0;color:#94a3b8">Open Positions (Edge & All Metrics)</h4>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Pair</th><th>Side</th><th>Qty Y / X</th><th>Entry Y / X</th><th>Now Y / X</th>
+          <th>Z (In→Now)</th><th>Edge (% / $)</th><th>uPnL ($)</th><th>Beta</th><th>ADF</th>
+          <th>HL</th><th>Corr</th><th>Remaining Time</th><th>Opened (IST)</th>
+        </tr>
+      </thead>
+      <tbody id="openPos"><tr><td colspan="14">No open positions</td></tr></tbody>
+    </table>
+  </div>
 
-  <div class="cols">
-    <div>
-      <h4 style="margin:0 0 8px 0;color:#94a3b8">Top Ranked Pairs (Entry Criteria Sorted)</h4>
-      <table>
-        <thead><tr><th>Pair</th><th>Status</th><th>Z</th><th>Beta</th><th>ADF</th><th>HL</th></tr></thead>
-        <tbody id="topPairs"><tr><td colspan="6">Scanning...</td></tr></tbody>
-      </table>
-    </div>
-    <div>
-      <h4 style="margin:0 0 8px 0;color:#94a3b8">Simulated Trade History (IST)</h4>
-      <table>
-        <thead><tr><th>Time (IST)</th><th>Pair</th><th>Side</th><th>Z In/Out</th><th>PnL ($)</th></tr></thead>
-        <tbody id="trades"><tr><td colspan="5">No trades yet</td></tr></tbody>
-      </table>
-    </div>
+  <h4 style="margin:0 0 8px 0;color:#94a3b8">Top Ranked Pairs (Edge & All Metrics)</h4>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Pair</th><th>Status</th><th>Z-Score</th><th>Edge (% / $)</th><th>Price Y / X</th>
+          <th>Beta</th><th>Alpha</th><th>Spread / Mean</th><th>ADF</th><th>HL</th><th>Corr</th><th>Score</th>
+        </tr>
+      </thead>
+      <tbody id="topPairs"><tr><td colspan="12">Scanning...</td></tr></tbody>
+    </table>
+  </div>
+
+  <h4 style="margin:0 0 8px 0;color:#94a3b8">Simulated Trade History (IST)</h4>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Time (IST)</th><th>Pair</th><th>Side</th><th>Z In/Out</th><th>Edge %</th><th>PnL ($)</th><th>Reason</th></tr></thead>
+      <tbody id="trades"><tr><td colspan="7">No trades yet</td></tr></tbody>
+    </table>
   </div>
 
   <h4 style="margin:0 0 8px 0;color:#94a3b8">Recent Activity (IST)</h4>
@@ -462,10 +536,78 @@ DASHBOARD_HTML = """<!doctype html>
 <script>
 const REFRESH_INTERVAL_SEC = 3;
 let remainingSec = REFRESH_INTERVAL_SEC;
+let latestPositions = [];
 
-function fmtPnl(v) {
-  const cls = v > 0 ? 'pos-green' : (v < 0 ? 'neg-red' : '');
-  return `<span class="${cls}">${v >= 0 ? '+' : ''}${v.toFixed(2)}</span>`;
+function fmtSigned(v, dec=2, suffix='') {
+  const num = Number(v || 0);
+  const cls = num > 0 ? 'pos-green' : (num < 0 ? 'neg-red' : '');
+  return `<span class="${cls}">${num >= 0 ? '+' : ''}${num.toFixed(dec)}${suffix}</span>`;
+}
+
+function fmtPrice(v) {
+  const n = Number(v || 0);
+  if (n >= 1000) return n.toFixed(1);
+  if (n >= 1) return n.toFixed(3);
+  return n.toFixed(5);
+}
+
+function fmtDuration(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${r}s`;
+  return `${r}s`;
+}
+
+function renderRemainingBar(p) {
+  const maxSec = Math.max(60, (p.max_hold_min || 720) * 60);
+  const remSec = Math.max(0, Number(p.remaining_sec ?? maxSec));
+  const pct = Math.min(100, Math.max(0, (remSec / maxSec) * 100));
+  const color = pct > 50 ? '#22c55e' : (pct > 20 ? '#f59e0b' : '#ef4444');
+  return `
+    <div class="rem-box">
+      <div class="rem-text"><span>${fmtDuration(remSec)}</span><span>${pct.toFixed(0)}%</span></div>
+      <div class="rem-track"><div class="rem-fill" style="width:${pct.toFixed(1)}%;background:${color};"></div></div>
+    </div>
+  `;
+}
+
+function renderOpenPositions() {
+  const tbody = document.getElementById('openPos');
+  if (!latestPositions || latestPositions.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="14">No open positions</td></tr>';
+    return;
+  }
+  tbody.innerHTML = latestPositions.map(p => `
+    <tr>
+      <td><b>${p.label}</b></td>
+      <td>${(p.side || '').replace('_SPREAD','')}</td>
+      <td>${p.qty_y} / ${p.qty_x}</td>
+      <td>${fmtPrice(p.entry_y)} / ${fmtPrice(p.entry_x)}</td>
+      <td>${fmtPrice(p.current_y)} / ${fmtPrice(p.current_x)}</td>
+      <td>${p.entry_z} → ${p.current_z}</td>
+      <td>${fmtSigned(p.edge_pct, 2, '%')} (${fmtSigned(p.edge_usdt, 2, '$')})</td>
+      <td>${fmtSigned(p.unrealized_pnl, 2)}</td>
+      <td>${Number(p.beta || 0).toFixed(3)}</td>
+      <td>${Number(p.adf_stat || 0).toFixed(2)}</td>
+      <td>${Number(p.half_life || 0).toFixed(0)}b</td>
+      <td>${Number(p.corr || 0).toFixed(2)}</td>
+      <td>${renderRemainingBar(p)}</td>
+      <td>${p.entry_time}</td>
+    </tr>
+  `).join('');
+}
+
+function tickLocalRemainingTimers() {
+  if (!latestPositions || latestPositions.length === 0) return;
+  latestPositions.forEach(p => {
+    if (typeof p.remaining_sec === 'number') {
+      p.remaining_sec = Math.max(0, p.remaining_sec - 1);
+    }
+  });
+  renderOpenPositions();
 }
 
 function updateClockAndTimer() {
@@ -481,36 +623,49 @@ function updateClockAndTimer() {
 }
 
 function applyState(s) {
-  const posList = s.positions || [];
+  latestPositions = s.positions || [];
   document.getElementById('pair').textContent = `Focus: ${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.scan_status}`;
   const badge = document.getElementById('mode');
   badge.textContent = s.dry_run ? 'SIMULATED PAPER' : 'LIVE TRADING';
   badge.className = 'badge ' + (s.dry_run ? 'dry' : 'live');
-  document.getElementById('eq').textContent = s.sim_equity.toFixed(2);
-  document.getElementById('pnl').innerHTML = `${fmtPnl(s.realized_pnl)} / ${fmtPnl(s.unrealized_pnl)}`;
-  document.getElementById('openCount').textContent = `${posList.length} / ${s.max_positions}`;
+  document.getElementById('eq').textContent = Number(s.sim_equity || 0).toFixed(2);
+  document.getElementById('pnl').innerHTML = `${fmtSigned(s.realized_pnl, 2)} / ${fmtSigned(s.unrealized_pnl, 2)}`;
+  document.getElementById('openCount').textContent = `${latestPositions.length} / ${s.max_positions}`;
   document.getElementById('readyCount').textContent = `${s.ready_count} ready`;
   document.getElementById('wl').textContent = `${s.wins} / ${s.losses}`;
   document.getElementById('univ').textContent = `${s.universe_count}c / ${s.last_scan_sec}s`;
   document.getElementById('btnPause').disabled = !s.running;
   document.getElementById('btnResume').disabled = s.running;
-  document.getElementById('btnClose').disabled = posList.length === 0;
+  document.getElementById('btnClose').disabled = latestPositions.length === 0;
 
-  document.getElementById('openPos').innerHTML = posList.length
-    ? posList.map(p => `<tr><td><b>${p.label}</b></td><td>${p.side.replace('_SPREAD','')}</td><td>${p.entry_z}</td><td>${p.current_z}</td><td>${fmtPnl(p.unrealized_pnl)}</td><td>${p.entry_time}</td></tr>`).join('')
-    : '<tr><td colspan="6">No open positions</td></tr>';
+  renderOpenPositions();
 
   if (s.top_pairs && s.top_pairs.length) {
     document.getElementById('topPairs').innerHTML = s.top_pairs.map(p => {
       const tag = p.entry_ready
         ? '<span class="ready-pill">ENTRY MET</span>'
         : (p.is_cointegrated ? '<span class="watch-pill">COINT</span>' : '<span class="watch-pill">WATCH</span>');
-      return `<tr><td>${p.pair_y.split('/')[0]}/${p.pair_x.split('/')[0]}</td><td>${tag}</td><td>${p.z_score.toFixed(2)}</td><td>${p.beta.toFixed(2)}</td><td>${p.adf_stat.toFixed(2)}</td><td>${p.half_life.toFixed(0)}b</td></tr>`;
+      return `
+        <tr>
+          <td><b>${p.pair_y.split('/')[0]}/${p.pair_x.split('/')[0]}</b></td>
+          <td>${tag}</td>
+          <td>${Number(p.z_score || 0).toFixed(2)}</td>
+          <td>${fmtSigned(p.edge_pct, 2, '%')} (${fmtSigned(p.edge_usdt, 2, '$')})</td>
+          <td>${fmtPrice(p.price_y)} / ${fmtPrice(p.price_x)}</td>
+          <td>${Number(p.beta || 0).toFixed(3)}</td>
+          <td>${Number(p.alpha || 0).toFixed(3)}</td>
+          <td>${Number(p.spread_now || 0).toFixed(3)} / ${Number(p.spread_mean || 0).toFixed(3)}</td>
+          <td>${Number(p.adf_stat || 0).toFixed(2)}</td>
+          <td>${Number(p.half_life || 0).toFixed(0)}b</td>
+          <td>${Number(p.corr || 0).toFixed(2)}</td>
+          <td>${Number(p.score || 0).toFixed(2)}</td>
+        </tr>
+      `;
     }).join('');
   }
   if (s.trades && s.trades.length) {
     document.getElementById('trades').innerHTML = s.trades.map(t =>
-      `<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.side.replace('_SPREAD','')}</td><td>${t.entry_z} → ${t.exit_z}</td><td>${fmtPnl(t.pnl)}</td></tr>`
+      `<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.side.replace('_SPREAD','')}</td><td>${t.entry_z} → ${t.exit_z}</td><td>${fmtSigned(t.edge_pct, 2, '%')}</td><td>${fmtSigned(t.pnl, 2)}</td><td>${t.reason || '-'}</td></tr>`
     ).join('');
   }
   if (s.events && s.events.length) {
@@ -545,6 +700,7 @@ refresh();
 setInterval(() => {
   remainingSec = Math.max(0, remainingSec - 1);
   updateClockAndTimer();
+  tickLocalRemainingTimers();
 }, 1000);
 setInterval(refresh, REFRESH_INTERVAL_SEC * 1000);
 </script>
@@ -553,10 +709,12 @@ setInterval(refresh, REFRESH_INTERVAL_SEC * 1000);
 
 
 def snapshot_state() -> dict:
+    enrich_position_timers()
     return {
         "running": state["running"],
         "persist_state": PERSIST_STATE,
         "state_file": STATE_FILE,
+        "max_hold_min": MAX_HOLD_MINUTES,
         "scan_status": state["scan_status"],
         "last_scan_sec": state["last_scan_sec"],
         "dry_run": DRY_RUN,
@@ -636,16 +794,16 @@ async def start_web():
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
+    enrich_position_timers()
     m = state["metrics"]
     pos_lines = [
-        f"• {p['label']} ({p['side']}): Z {p['entry_z']}→{p['current_z']} | uPnL {p['unrealized_pnl']:+.2f}"
+        f"• {p['label']} ({p['side']}): Z {p['entry_z']}→{p['current_z']} | Edge {p.get('edge_pct',0):+.2f}% ({p.get('edge_usdt',0):+.2f}$) | uPnL {p['unrealized_pnl']:+.2f} | β={p.get('beta',0)} | ADF={p.get('adf_stat',0)} | HL={p.get('half_life',0)}b | Rem {p['remaining_sec']//60}m"
         for p in state["positions"]
     ]
     pos_block = "\n".join(pos_lines) if pos_lines else "None (FLAT)"
-    z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | ADF: {m['adf_stat']:.2f}" if m else state["scan_status"]
+    z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | Edge {m.get('edge_pct',0):+.2f}% | ADF: {m['adf_stat']:.2f}" if m else state["scan_status"]
     await update.message.reply_text(
         f"Mode: {'SIMULATOR' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'}\n"
-        f"Persist: {'ON' if PERSIST_STATE else 'OFF'} ({STATE_FILE})\n"
         f"Scan: {state['universe_count']} coins in {state['last_scan_sec']}s ({state['ready_count']} entry-ready)\n"
         f"Open Pairs: {len(state['positions'])}/{MAX_POSITIONS} | Total uPnL: {state['unrealized_pnl']:+.2f} USDT\n"
         f"Focus ({state['active_pair_y'].split('/')[0]}/{state['active_pair_x'].split('/')[0]}): {z_txt}\n"
@@ -679,7 +837,10 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         y_n = p["pair_y"].split("/")[0]
         x_n = p["pair_x"].split("/")[0]
         tag = "[ENTRY]" if p.get("entry_ready") else ("[COINT]" if p.get("is_cointegrated") else "[WATCH]")
-        lines.append(f"• {tag} {y_n}/{x_n}: Z={p['z_score']:+.2f} | ADF={p['adf_stat']:.2f} | HL={p['half_life']:.0f}b")
+        lines.append(
+            f"• {tag} {y_n}/{x_n}: Z={p['z_score']:+.2f} | Edge={p.get('edge_pct',0):+.2f}% ({p.get('edge_usdt',0):+.2f}$) | "
+            f"β={p['beta']:.2f} | ADF={p['adf_stat']:.2f} | HL={p['half_life']:.0f}b | Corr={p['corr']:.2f} | Sc={p['score']:.2f}"
+        )
     await update.message.reply_text("\n".join(lines))
 
 
@@ -691,7 +852,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["Recent Simulated Trades (IST):"]
     for t in state["trades"][:8]:
-        lines.append(f"• {t['time']} {t['pair']} {t['side']} ({t['entry_z']}→{t['exit_z']}): {t['pnl']:+.2f} USDT")
+        lines.append(f"• {t['time']} {t['pair']} {t['side']} ({t['entry_z']}→{t['exit_z']}) Edge {t.get('edge_pct',0):+.2f}%: {t['pnl']:+.2f} USDT [{t.get('reason','')}]")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -765,9 +926,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"Commands (Auto-selecting top coins, max {MAX_POSITIONS} pairs):\n"
-        "/status - Open positions, Z-score, unrealized PnL\n"
+        "/status - Open positions, Edge, Z-score, metrics, remaining time\n"
         "/pnl - Simulated equity, realized PnL, win/loss stats\n"
-        "/top - Top entry-ready & cointegrated pairs\n"
+        "/top - Top ranked pairs with Edge & all metrics\n"
         "/trades - Recent simulated trade history (IST)\n"
         "/balance - Gate.io live USDT futures balance\n"
         "/setz <val> - Set Z-score entry threshold\n"
@@ -823,29 +984,46 @@ async def trader_loop(tg_app: Application):
                             f"Scan started in {elapsed}s ({len(ohlcv_map)} coins, {len(state['positions'])} open pos restored)"
                         )
 
+                    # Refresh metrics, edge, uPnL, and timers for all open positions
                     for pos in list(state["positions"]):
                         py, px = pos["pair_y"], pos["pair_x"]
                         if py in ohlcv_map and px in ohlcv_map:
                             m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
+                            cy = float(ohlcv_map[py]["close"].iloc[-1])
+                            cx = float(ohlcv_map[px]["close"].iloc[-1])
                             pos["current_z"] = round(m["z_score"], 2)
-                            pos["current_y"] = m["price_y"]
-                            pos["current_x"] = m["price_x"]
-                            pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, m["price_y"], m["price_x"]), 3)
+                            pos["current_y"] = cy
+                            pos["current_x"] = cx
+                            pos["beta"] = round(m["beta"], 3)
+                            pos["adf_stat"] = round(m["adf_stat"], 2)
+                            pos["half_life"] = round(m["half_life"], 1)
+                            pos["corr"] = round(m["corr"], 2)
+                            e_pct, e_usdt = compute_position_live_edge(pos, m, cy, cx)
+                            pos["edge_pct"] = e_pct
+                            pos["edge_usdt"] = e_usdt
+                            pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, cy, cx), 3)
 
-                            if state["running"] and engine.get_signal(m, pos["side"]) == "CLOSE":
-                                reason = "STOP_LOSS" if abs(m["z_score"]) >= engine.z_stop else "MEAN_REVERT"
+                            timed_out = is_expired(pos)
+                            sig = engine.get_signal(m, pos["side"])
+                            if state["running"] and (sig == "CLOSE" or timed_out):
+                                if timed_out:
+                                    reason = "MAX_HOLD_TIME"
+                                elif abs(m["z_score"]) >= engine.z_stop:
+                                    reason = "STOP_LOSS"
+                                else:
+                                    reason = "MEAN_REVERT"
                                 tr = await close_single_position(
                                     ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason
                                 )
                                 msg = (
                                     f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']}) • {tr['time']} IST\n"
-                                    f"Z: {tr['entry_z']} → {tr['exit_z']} | Net PnL: {tr['pnl']:+.2f} USDT\n"
+                                    f"Z: {tr['entry_z']} → {tr['exit_z']} | Edge: {tr.get('edge_pct',0):+.2f}% | Net PnL: {tr['pnl']:+.2f} USDT\n"
                                     f"Sim Equity: {state['sim_equity']:.2f} USDT"
                                 )
                                 add_event(f"CLOSED {tr['pair']} {tr['pnl']:+.2f} USDT ({reason})")
                                 await tg_app.bot.send_message(ADMIN_ID, msg)
 
-                    refresh_unrealized_pnl(ohlcv_map)
+                    refresh_positions_from_ohlcv(ohlcv_map)
 
                     if state["positions"]:
                         focus = state["positions"][0]
@@ -880,11 +1058,12 @@ async def trader_loop(tg_app: Application):
                                 state["metrics"] = cand
                                 msg = (
                                     f"[AUTO ENTRY {len(state['positions'])}/{MAX_POSITIONS}] {sig} on {pos_rec['label']} • {pos_rec['entry_time']}\n"
-                                    f"Z: {cand['z_score']:+.2f} | Beta: {cand['beta']:.3f} | ADF: {cand['adf_stat']:.2f} | HL: {cand['half_life']:.0f}b\n"
+                                    f"Z: {cand['z_score']:+.2f} | Edge: {cand['edge_pct']:+.2f}% ({cand['edge_usdt']:+.2f}$)\n"
+                                    f"β={cand['beta']:.3f} | ADF={cand['adf_stat']:.2f} | HL={cand['half_life']:.0f}b | Corr={cand['corr']:.2f}\n"
                                     f"{pos_rec['side_y'].upper()} {pos_rec['qty_y']} {cand['pair_y']} @ {cand['price_y']}\n"
                                     f"{pos_rec['side_x'].upper()} {pos_rec['qty_x']} {cand['pair_x']} @ {cand['price_x']}"
                                 )
-                                add_event(f"AUTO OPENED {sig} {pos_rec['label']} @ Z={cand['z_score']:+.2f}")
+                                add_event(f"AUTO OPENED {sig} {pos_rec['label']} @ Z={cand['z_score']:+.2f} Edge={cand['edge_pct']:+.2f}%")
                                 await tg_app.bot.send_message(ADMIN_ID, msg)
 
                 except Exception as e:
