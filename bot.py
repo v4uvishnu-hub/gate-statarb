@@ -128,7 +128,9 @@ def apply_saved_payload(saved: dict, source_label: str):
     state["losses"] = int(saved.get("losses", 0))
     state["trades"] = list(saved.get("trades", []))
     state["events"] = list(saved.get("events", []))
-    state["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0)) for p in state["positions"])
+    state["unrealized_pnl"] = round(
+        sum(float(p.get("unrealized_pnl") or 0.0) for p in state["positions"]), 3
+    )
     log.info(
         f"Restored state from {source_label}: {len(state['positions'])} open pos, "
         f"{len(state['trades'])} trades, equity={state['sim_equity']:.2f}"
@@ -240,26 +242,32 @@ def auth(update: Update) -> bool:
 
 
 def leg_unrealized_pnl(pos: dict, price_y: float, price_x: float) -> float:
-    if pos["side"] == "LONG_SPREAD":
-        pnl_y = (price_y - pos["entry_y"]) * pos["qty_y"]
-        pnl_x = (pos["entry_x"] - price_x) * pos["qty_x"]
+    qy = float(pos.get("qty_y") or 0.0)
+    qx = float(pos.get("qty_x") or 0.0)
+    ey = float(pos.get("entry_y") or 0.0)
+    ex_p = float(pos.get("entry_x") or 0.0)
+    if pos.get("side") == "LONG_SPREAD":
+        pnl_y = (price_y - ey) * qy
+        pnl_x = (ex_p - price_x) * qx
     else:
-        pnl_y = (pos["entry_y"] - price_y) * pos["qty_y"]
-        pnl_x = (price_x - pos["entry_x"]) * pos["qty_x"]
+        pnl_y = (ey - price_y) * qy
+        pnl_x = (price_x - ex_p) * qx
     return float(pnl_y + pnl_x)
 
 
 def compute_position_live_edge(pos: dict, m: dict, cy: float, cx: float) -> tuple[float, float]:
     z_now = float(m["z_score"])
     spread_std = float(m.get("spread_std") or 0.01)
-    if pos["side"] == "LONG_SPREAD":
+    if pos.get("side") == "LONG_SPREAD":
         revert_z = max(0.0, (-engine.z_exit) - z_now)
     else:
         revert_z = max(0.0, z_now - engine.z_exit)
     gross_pct = (np.exp(min(revert_z * spread_std, 1.0)) - 1.0) * 100.0
     exit_fee_pct = TAKER_FEE_RATE * 2.0 * 100.0
     edge_pct = float(gross_pct - exit_fee_pct)
-    notional_now = pos["qty_y"] * cy + pos["qty_x"] * cx
+    qy = float(pos.get("qty_y") or 0.0)
+    qx = float(pos.get("qty_x") or 0.0)
+    notional_now = qy * cy + qx * cx
     edge_usdt = float((edge_pct / 100.0) * notional_now)
     return round(edge_pct, 3), round(edge_usdt, 3)
 
@@ -286,6 +294,8 @@ def refresh_positions_from_ohlcv(ohlcv_map: dict[str, pd.DataFrame]):
     total_u = 0.0
     for pos in state["positions"]:
         py, px = pos["pair_y"], pos["pair_x"]
+        cy = float(pos.get("current_y") or pos.get("entry_y") or 0.0)
+        cx = float(pos.get("current_x") or pos.get("entry_x") or 0.0)
         if py in ohlcv_map and px in ohlcv_map:
             m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
             cy = float(ohlcv_map[py]["close"].iloc[-1])
@@ -300,9 +310,20 @@ def refresh_positions_from_ohlcv(ohlcv_map: dict[str, pd.DataFrame]):
             e_pct, e_usdt = compute_position_live_edge(pos, m, cy, cx)
             pos["edge_pct"] = e_pct
             pos["edge_usdt"] = e_usdt
-            pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, cy, cx), 3)
-        total_u += float(pos.get("unrealized_pnl", 0.0))
-    state["unrealized_pnl"] = float(total_u)
+        else:
+            if py in ohlcv_map:
+                cy = float(ohlcv_map[py]["close"].iloc[-1])
+                pos["current_y"] = cy
+            if px in ohlcv_map:
+                cx = float(ohlcv_map[px]["close"].iloc[-1])
+                pos["current_x"] = cx
+        if cy > 0 and cx > 0:
+            u_pnl = leg_unrealized_pnl(pos, cy, cx)
+            pos["unrealized_pnl"] = round(u_pnl, 3)
+        else:
+            pos["unrealized_pnl"] = round(float(pos.get("unrealized_pnl") or 0.0), 3)
+        total_u += float(pos["unrealized_pnl"])
+    state["unrealized_pnl"] = round(float(total_u), 3)
     enrich_position_timers()
 
 
@@ -533,6 +554,7 @@ DASHBOARD_HTML = """<!doctype html>
     .val { font-size: 20px; font-weight: 700; }
     .pos-green { color: #4ade80; }
     .neg-red { color: #f87171; }
+    .edge-normal { color: #e2e8f0; }
     .rem-box { min-width: 135px; }
     .rem-text { font-family: monospace; font-size: 11px; color: #cbd5e1; margin-bottom: 4px; display: flex; justify-content: space-between; }
     .rem-track { width: 100%; height: 8px; background: #0f172a; border-radius: 999px; overflow: hidden; border: 1px solid #334155; }
@@ -619,12 +641,20 @@ let latestPositions = [];
 
 function fmtSigned(v, dec=2, suffix='') {
   const num = Number(v || 0);
+  if (!Number.isFinite(num)) return `0.${'0'.repeat(dec)}${suffix}`;
   const cls = num > 0 ? 'pos-green' : (num < 0 ? 'neg-red' : '');
   return `<span class="${cls}">${num >= 0 ? '+' : ''}${num.toFixed(dec)}${suffix}</span>`;
 }
 
+function fmtNeutral(v, dec=2, suffix='') {
+  const num = Number(v);
+  if (!Number.isFinite(num)) return `<span class="edge-normal">0.${'0'.repeat(dec)}${suffix}</span>`;
+  return `<span class="edge-normal">${num >= 0 ? '+' : ''}${num.toFixed(dec)}${suffix}</span>`;
+}
+
 function fmtPrice(v) {
   const n = Number(v || 0);
+  if (!Number.isFinite(n) || n === 0) return '-';
   if (n >= 1000) return n.toFixed(1);
   if (n >= 1) return n.toFixed(3);
   return n.toFixed(5);
@@ -667,7 +697,7 @@ function renderOpenPositions() {
       <td>${fmtPrice(p.entry_y)} / ${fmtPrice(p.entry_x)}</td>
       <td>${fmtPrice(p.current_y)} / ${fmtPrice(p.current_x)}</td>
       <td>${p.entry_z} → ${p.current_z}</td>
-      <td>${fmtSigned(p.edge_pct, 2, '%')} (${fmtSigned(p.edge_usdt, 2, '$')})</td>
+      <td>${fmtNeutral(p.edge_pct, 2, '%')} (${fmtNeutral(p.edge_usdt, 2, '$')})</td>
       <td>${fmtSigned(p.unrealized_pnl, 2)}</td>
       <td>${Number(p.beta || 0).toFixed(3)}</td>
       <td>${Number(p.adf_stat || 0).toFixed(2)}</td>
@@ -729,7 +759,7 @@ function applyState(s) {
           <td><b>${p.pair_y.split('/')[0]}/${p.pair_x.split('/')[0]}</b></td>
           <td>${tag}</td>
           <td>${Number(p.z_score || 0).toFixed(2)}</td>
-          <td>${fmtSigned(p.edge_pct, 2, '%')} (${fmtSigned(p.edge_usdt, 2, '$')})</td>
+          <td>${fmtNeutral(p.edge_pct, 2, '%')} (${fmtNeutral(p.edge_usdt, 2, '$')})</td>
           <td>${fmtPrice(p.price_y)} / ${fmtPrice(p.price_x)}</td>
           <td>${Number(p.beta || 0).toFixed(3)}</td>
           <td>${Number(p.alpha || 0).toFixed(3)}</td>
@@ -744,7 +774,7 @@ function applyState(s) {
   }
   if (s.trades && s.trades.length) {
     document.getElementById('trades').innerHTML = s.trades.map(t =>
-      `<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.side.replace('_SPREAD','')}</td><td>${t.entry_z} → ${t.exit_z}</td><td>${fmtSigned(t.edge_pct, 2, '%')}</td><td>${fmtSigned(t.pnl, 2)}</td><td>${t.reason || '-'}</td></tr>`
+      `<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.side.replace('_SPREAD','')}</td><td>${t.entry_z} → ${t.exit_z}</td><td>${fmtNeutral(t.edge_pct, 2, '%')}</td><td>${fmtSigned(t.pnl, 2)}</td><td>${t.reason || '-'}</td></tr>`
     ).join('');
   }
   if (s.events && s.events.length) {
@@ -1077,9 +1107,9 @@ async def trader_loop(tg_app: Application):
                             m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
                             cy = float(ohlcv_map[py]["close"].iloc[-1])
                             cx = float(ohlcv_map[px]["close"].iloc[-1])
-                            pos["current_z"] = round(m["z_score"], 2)
                             pos["current_y"] = cy
                             pos["current_x"] = cx
+                            pos["current_z"] = round(m["z_score"], 2)
                             pos["beta"] = round(m["beta"], 3)
                             pos["adf_stat"] = round(m["adf_stat"], 2)
                             pos["half_life"] = round(m["half_life"], 1)
