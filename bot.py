@@ -86,10 +86,17 @@ DASHBOARD_HTML = """<!doctype html>
   <style>
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
     .wrap { max-width: 900px; margin: 0 auto; }
-    .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+    .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 12px; flex-wrap: wrap; }
     .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
     .live { background: #065f46; color: #6ee7b7; }
     .dry { background: #78350f; color: #fcd34d; }
+    .controls { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+    button { border: 1px solid #334155; background: #1e293b; color: #f8fafc; padding: 9px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }
+    button:hover:not(:disabled) { background: #334155; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-pause { border-color: #d97706; color: #fcd34d; }
+    .btn-resume { border-color: #059669; color: #6ee7b7; }
+    .btn-close { border-color: #dc2626; color: #fca5a5; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 18px; }
     .card { background: #1e293b; padding: 14px; border-radius: 10px; border: 1px solid #334155; }
     .label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
@@ -109,6 +116,11 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
     <span id="mode" class="badge dry">LOADING</span>
   </div>
+  <div class="controls">
+    <button id="btnPause" class="btn-pause" onclick="sendAction('pause')">Pause</button>
+    <button id="btnResume" class="btn-resume" onclick="sendAction('resume')">Resume</button>
+    <button id="btnClose" class="btn-close" onclick="sendAction('closeall')">Close All</button>
+  </div>
   <div class="grid">
     <div class="card"><div class="label">Z-Score</div><div class="val" id="z">-</div></div>
     <div class="card"><div class="label">Position</div><div class="val" id="pos">FLAT</div></div>
@@ -120,6 +132,29 @@ DASHBOARD_HTML = """<!doctype html>
   <ul id="events"><li>Waiting for first scan...</li></ul>
 </div>
 <script>
+let currentState = null;
+
+function applyState(s) {
+  currentState = s;
+  document.getElementById('pair').textContent = `${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.running ? 'ACTIVE' : 'PAUSED'}`;
+  const badge = document.getElementById('mode');
+  badge.textContent = s.dry_run ? 'DRY RUN' : 'LIVE';
+  badge.className = 'badge ' + (s.dry_run ? 'dry' : 'live');
+  document.getElementById('pos').textContent = s.position || 'FLAT';
+  document.getElementById('zentry').textContent = '±' + s.z_entry.toFixed(2);
+  document.getElementById('btnPause').disabled = !s.running;
+  document.getElementById('btnResume').disabled = s.running;
+  document.getElementById('btnClose').disabled = !s.position;
+  if (s.metrics && s.metrics.z_score !== undefined) {
+    document.getElementById('z').textContent = s.metrics.z_score.toFixed(3);
+    document.getElementById('beta').textContent = s.metrics.beta.toFixed(4);
+    drawChart(s.metrics.z_history, s.z_entry);
+  }
+  if (s.events && s.events.length) {
+    document.getElementById('events').innerHTML = s.events.map(e => `<li>${e}</li>`).join('');
+  }
+}
+
 function drawChart(pts, entry) {
   const svg = document.getElementById('chart');
   if (!pts || pts.length < 2) return;
@@ -134,24 +169,26 @@ function drawChart(pts, entry) {
     <path d="${d}" fill="none" stroke="#38bdf8" stroke-width="2.5" />
   `;
 }
+
+async function sendAction(action) {
+  if (action === 'closeall' && !confirm('Close all active spread legs now?')) return;
+  const btns = ['btnPause', 'btnResume', 'btnClose'].map(id => document.getElementById(id));
+  btns.forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(`/api/${action}`, { method: 'POST' });
+    const data = await r.json();
+    if (data.state) applyState(data.state);
+    await refresh();
+  } catch (e) {
+    await refresh();
+  }
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/state');
     const s = await r.json();
-    document.getElementById('pair').textContent = `${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.running ? 'ACTIVE' : 'PAUSED'}`;
-    const badge = document.getElementById('mode');
-    badge.textContent = s.dry_run ? 'DRY RUN' : 'LIVE';
-    badge.className = 'badge ' + (s.dry_run ? 'dry' : 'live');
-    document.getElementById('pos').textContent = s.position || 'FLAT';
-    document.getElementById('zentry').textContent = '±' + s.z_entry.toFixed(2);
-    if (s.metrics && s.metrics.z_score !== undefined) {
-      document.getElementById('z').textContent = s.metrics.z_score.toFixed(3);
-      document.getElementById('beta').textContent = s.metrics.beta.toFixed(4);
-      drawChart(s.metrics.z_history, s.z_entry);
-    }
-    if (s.events.length) {
-      document.getElementById('events').innerHTML = s.events.map(e => `<li>${e}</li>`).join('');
-    }
+    applyState(s);
   } catch (e) {}
 }
 refresh();
@@ -159,6 +196,21 @@ setInterval(refresh, 5000);
 </script>
 </body>
 </html>"""
+
+
+def snapshot_state() -> dict:
+    return {
+        "running": state["running"],
+        "dry_run": DRY_RUN,
+        "pair_y": PAIR_Y,
+        "pair_x": PAIR_X,
+        "timeframe": TIMEFRAME,
+        "position": state["position"],
+        "z_entry": engine.z_entry,
+        "metrics": state["metrics"],
+        "updated_at": state["updated_at"],
+        "events": state["events"],
+    }
 
 
 async def handle_dashboard(request: web.Request):
@@ -170,18 +222,33 @@ async def handle_health(request: web.Request):
 
 
 async def handle_api_state(request: web.Request):
-    return web.json_response({
-        "running": state["running"],
-        "dry_run": DRY_RUN,
-        "pair_y": PAIR_Y,
-        "pair_x": PAIR_X,
-        "timeframe": TIMEFRAME,
-        "position": state["position"],
-        "z_entry": engine.z_entry,
-        "metrics": state["metrics"],
-        "updated_at": state["updated_at"],
-        "events": state["events"],
-    })
+    return web.json_response(snapshot_state())
+
+
+async def handle_api_pause(request: web.Request):
+    state["running"] = False
+    add_event("Engine paused via Web Dashboard")
+    return web.json_response({"ok": True, "state": snapshot_state()})
+
+
+async def handle_api_resume(request: web.Request):
+    state["running"] = True
+    add_event("Engine resumed via Web Dashboard")
+    return web.json_response({"ok": True, "state": snapshot_state()})
+
+
+async def handle_api_closeall(request: web.Request):
+    ex = make_exchange()
+    try:
+        prev = state["position"]
+        await close_spread(ex)
+        add_event(f"Close All executed via Web Dashboard (was {prev or 'FLAT'})")
+        return web.json_response({"ok": True, "state": snapshot_state()})
+    except Exception as e:
+        add_event(f"Dashboard Close All failed: {e}")
+        return web.json_response({"ok": False, "error": str(e), "state": snapshot_state()}, status=500)
+    finally:
+        await ex.close()
 
 
 async def start_web():
@@ -189,6 +256,9 @@ async def start_web():
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/state", handle_api_state)
+    app.router.add_post("/api/pause", handle_api_pause)
+    app.router.add_post("/api/resume", handle_api_resume)
+    app.router.add_post("/api/closeall", handle_api_closeall)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
