@@ -532,6 +532,28 @@ class StatArbBot:
         except Exception as exc:
             log.warning("answerCallbackQuery error: %s", exc)
 
+    async def send_startup_notification(self) -> None:
+        async with self.store.lock:
+            state = self.store.state
+            cfg = state.get("config", {})
+            mode = "PAPER (DRY_RUN)" if cfg.get("DRY_RUN", True) else "LIVE TRADING"
+            alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
+            open_cnt = len(state.get("positions", []))
+            max_pos = cfg.get("MAX_POSITIONS", 3)
+            has_pin = bool(state.get("pinned_message_id"))
+            self.store.add_event("SYSTEM", f"Bot started ({mode})")
+            await self.store.save()
+
+        msg = (
+            f"🚀 <b>STATARB BOT STARTED</b>\n"
+            f"<b>Mode:</b> <code>{html.escape(mode)}</code> | <b>Alerts:</b> <code>{alerts_state}</code>\n"
+            f"<b>Open Positions:</b> <code>{open_cnt}/{max_pos}</code>\n"
+            f"<b>Started At:</b> {html.escape(fmt_ist(now_ms()))}"
+        )
+        await self.send_telegram(msg, allow_when_muted=True)
+        if has_pin:
+            await self.sync_pinned_dashboard(force_new=False)
+
     async def _build_pinned_card_html(self) -> str:
         async with self.store.lock:
             state = self.store.state
@@ -1863,6 +1885,7 @@ async def main() -> None:
     scanner_task = asyncio.create_task(bot.scanner_loop())
     tg_task = asyncio.create_task(bot.telegram_polling_loop())
     pin_task = asyncio.create_task(bot.pinned_dashboard_loop())
+    asyncio.create_task(bot.send_startup_notification())
 
     try:
         await asyncio.gather(scanner_task, tg_task, pin_task)
