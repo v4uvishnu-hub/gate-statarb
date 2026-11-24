@@ -51,6 +51,7 @@ def env_float(name: str, default: float) -> float:
 def get_env_config_defaults() -> Dict[str, Any]:
     return {
         "DRY_RUN": env_bool("DRY_RUN", True),
+        "TRADE_ALERTS": env_bool("TRADE_ALERTS", True),
         "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 100))),
         "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 100))),
         "MAX_POSITIONS": max(1, min(10, env_int("MAX_POSITIONS", 3))),
@@ -427,8 +428,18 @@ class StatArbBot:
         self.tg_offset = 0
 
     async def send_telegram(
-        self, text: str, chat_id: Optional[str] = None, parse_mode: Optional[str] = "HTML"
+        self,
+        text: str,
+        chat_id: Optional[str] = None,
+        parse_mode: Optional[str] = "HTML",
+        allow_when_muted: bool = True,
     ) -> None:
+        if not allow_when_muted:
+            async with self.store.lock:
+                muted = not bool(self.store.state.get("config", {}).get("TRADE_ALERTS", True))
+            if muted:
+                return
+
         target = chat_id or TELEGRAM_ADMIN_ID
         if not TELEGRAM_BOT_TOKEN or not target:
             log.warning("Telegram alert skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_ADMIN_ID")
@@ -447,7 +458,12 @@ class StatArbBot:
                 if resp.status != 200:
                     log.warning("Telegram sendMessage failed (%s): %s", resp.status, body[:250])
                     if parse_mode is not None:
-                        await self.send_telegram(text, chat_id=target, parse_mode=None)
+                        await self.send_telegram(
+                            text,
+                            chat_id=target,
+                            parse_mode=None,
+                            allow_when_muted=allow_when_muted,
+                        )
         except Exception as exc:
             log.warning("Telegram send error: %s", exc)
 
@@ -613,7 +629,7 @@ class StatArbBot:
             )
 
         for msg in alerts:
-            await self.send_telegram(msg)
+            await self.send_telegram(msg, allow_when_muted=False)
         return total_pnl
 
     async def run_tick(self) -> None:
@@ -854,7 +870,7 @@ class StatArbBot:
             await self.store.save()
 
         for msg in alerts:
-            await self.send_telegram(msg)
+            await self.send_telegram(msg, allow_when_muted=False)
 
     async def process_telegram_update(self, update: Dict[str, Any]) -> None:
         msg = update.get("message") or {}
@@ -878,7 +894,8 @@ class StatArbBot:
                 "<code>/top</code> - Top ranked cointegrated pairs &amp; live Z-scores\n"
                 "<code>/trades</code> - Recent closed spread trades\n"
                 "<code>/balance</code> - Equity, notional &amp; hold settings\n"
-                "<code>/config</code> - View all 9 editable runtime parameters\n"
+                "<code>/config</code> - View editable runtime parameters\n"
+                "<code>/setalerts &lt;on|off&gt;</code> - Mute/unmute trade entry &amp; exit alerts\n"
                 "<code>/setdryrun &lt;true|false&gt; [confirm]</code> - Toggle paper/live mode\n"
                 "<code>/settopn &lt;10-200&gt;</code> - Set TOP_N_COINS\n"
                 "<code>/setlookback &lt;30-300&gt;</code> - Set LOOKBACK\n"
@@ -888,7 +905,7 @@ class StatArbBot:
                 "<code>/setz &lt;0.5-6.0&gt;</code> - Set Z_ENTRY\n"
                 "<code>/setzexit &lt;0.0-3.0&gt;</code> - Set Z_EXIT\n"
                 "<code>/setzstop &lt;1.5-10.0&gt;</code> - Set Z_STOP\n"
-                "<code>/resetconfig</code> - Reset all 9 parameters to defaults\n"
+                "<code>/resetconfig</code> - Reset parameters to defaults\n"
                 "<code>/testalert</code> - Send a sample trade alert\n"
                 "<code>/pause</code> | <code>/resume</code> | <code>/closeall</code>",
                 chat_id,
@@ -916,8 +933,9 @@ class StatArbBot:
             if cmd == "/status":
                 u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in state.get("positions", []))
                 mode = "PAPER (DRY_RUN)" if cfg["DRY_RUN"] else "LIVE TRADING"
+                alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
                 reply = (
-                    f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b>\n"
+                    f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b> | Alerts: <code>{alerts_state}</code>\n"
                     f"<b>Positions:</b> <code>{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}</code> | "
                     f"<b>Z Entry/Exit/Stop:</b> <code>{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}</code>\n"
                     f"<b>Unrealized PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
@@ -964,6 +982,7 @@ class StatArbBot:
                 rows = ["<b>Active Runtime Configuration:</b>"]
                 for key in [
                     "DRY_RUN",
+                    "TRADE_ALERTS",
                     "TOP_N_COINS",
                     "LOOKBACK",
                     "MAX_POSITIONS",
@@ -979,9 +998,9 @@ class StatArbBot:
 
             elif cmd == "/resetconfig":
                 state["config"] = get_env_config_defaults()
-                self.store.add_event("CONFIG", "All 9 runtime parameters reset to defaults via Telegram")
+                self.store.add_event("CONFIG", "All runtime parameters reset to defaults via Telegram")
                 await self.store.save()
-                reply = "✅ All 9 parameters reset to built-in defaults."
+                reply = "✅ All parameters reset to built-in defaults."
 
             elif cmd == "/pause":
                 state["paused"] = True
@@ -994,6 +1013,21 @@ class StatArbBot:
                 self.store.add_event("CONTROL", "Bot resumed via Telegram")
                 await self.store.save()
                 reply = "▶️ Bot <b>resumed</b>."
+
+            elif cmd == "/setalerts":
+                mode_arg = arg1.lower()
+                if mode_arg in ("on", "true", "1", "unmute"):
+                    cfg["TRADE_ALERTS"] = True
+                    self.store.add_event("CONFIG", "Trade alerts enabled (on) via Telegram")
+                    await self.store.save()
+                    reply = "✅ Trade alerts set to <b>ON</b> (entry/exit notifications active)."
+                elif mode_arg in ("off", "false", "0", "mute"):
+                    cfg["TRADE_ALERTS"] = False
+                    self.store.add_event("CONFIG", "Trade alerts muted (off) via Telegram")
+                    await self.store.save()
+                    reply = "🔇 Trade alerts set to <b>OFF</b> (bot keeps running; direct commands still reply)."
+                else:
+                    reply = "Usage: <code>/setalerts on</code> or <code>/setalerts off</code>"
 
             elif cmd == "/setdryrun":
                 v = arg1.lower()
