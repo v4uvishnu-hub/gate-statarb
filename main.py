@@ -38,13 +38,14 @@ HELP_TEXT_HTML = (
     "/status - Bot state, mode, alerts, slots &amp; last IST tick\n"
     "/pin - Pin &amp; auto-refresh live status card in chat\n"
     "/unpin - Unpin live status card\n"
-    "/pnl - Realized, unrealized PnL, equity &amp; W/L record\n"
+    "/pnl - Realized, daily, unrealized PnL &amp; W/L record\n"
     "/top - Top ranked cointegrated pairs &amp; live Z-scores\n"
     "/trades - Recent closed spread trades\n"
-    "/balance - Equity, leg notional &amp; max hold settings\n"
+    "/balance - Equity, live Gate margin, notional &amp; hold\n"
     "/config - View all editable runtime parameters\n"
     "/setalerts - Mute or unmute trade alerts (on or off)\n"
     "/setdryrun - Toggle paper (true) or live (false confirm)\n"
+    "/setdailyloss - Set max daily loss USDT guard (0 = off)\n"
     "/settopn - Set TOP_N_COINS universe size (10-200)\n"
     "/setlookback - Set LOOKBACK candle window (30-300)\n"
     "/setmaxpos - Set MAX_POSITIONS slot cap (1-10)\n"
@@ -87,6 +88,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
     return {
         "DRY_RUN": env_bool("DRY_RUN", True),
         "TRADE_ALERTS": env_bool("TRADE_ALERTS", True),
+        "MAX_DAILY_LOSS_USDT": max(0.0, min(100000.0, env_float("MAX_DAILY_LOSS_USDT", 50.0))),
         "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 100))),
         "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 100))),
         "MAX_POSITIONS": max(1, min(10, env_int("MAX_POSITIONS", 3))),
@@ -120,6 +122,11 @@ def fmt_ist(ts_ms: Optional[int]) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S IST")
 
 
+def ist_day_str(ts_ms: Optional[int] = None) -> str:
+    ms = now_ms() if ts_ms is None else ts_ms
+    return datetime.fromtimestamp(ms / 1000.0, tz=IST).strftime("%Y-%m-%d")
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -139,6 +146,8 @@ class StateStore:
             "config": get_env_config_defaults(),
             "sim_equity": INITIAL_EQUITY,
             "realized_pnl": 0.0,
+            "daily_realized_pnl": 0.0,
+            "daily_pnl_date": ist_day_str(),
             "wins": 0,
             "losses": 0,
             "positions": [],
@@ -156,6 +165,22 @@ class StateStore:
             "last_tick_ts": None,
             "last_error": None,
         }
+
+    def roll_daily_pnl_if_needed(self, ts_ms: Optional[int] = None) -> None:
+        today = ist_day_str(ts_ms)
+        if self.state.get("daily_pnl_date") != today:
+            self.state["daily_pnl_date"] = today
+            self.state["daily_realized_pnl"] = 0.0
+
+    def record_realized_pnl(self, pnl: float, ts_ms: Optional[int] = None) -> None:
+        self.roll_daily_pnl_if_needed(ts_ms)
+        self.state["realized_pnl"] = float(self.state.get("realized_pnl", 0.0)) + pnl
+        self.state["daily_realized_pnl"] = float(self.state.get("daily_realized_pnl", 0.0)) + pnl
+        self.state["sim_equity"] = float(self.state.get("sim_equity", INITIAL_EQUITY)) + pnl
+        if pnl >= 0:
+            self.state["wins"] = int(self.state.get("wins", 0)) + 1
+        else:
+            self.state["losses"] = int(self.state.get("losses", 0)) + 1
 
     async def init(self) -> None:
         if REDIS_URL:
@@ -205,6 +230,7 @@ class StateStore:
             base["events"] = loaded.get("events") if isinstance(loaded.get("events"), list) else base["events"]
             self.state = base
 
+        self.roll_daily_pnl_if_needed()
         await self.save()
 
     def add_event(self, ev_type: str, msg: str) -> None:
@@ -245,6 +271,32 @@ class GateClient:
                 raise RuntimeError(f"Gate GET {path} {resp.status}: {text[:180]}")
             return json.loads(text)
 
+    async def signed_get(self, path: str, query_string: str = "") -> Any:
+        if not GATE_API_KEY or not GATE_API_SECRET:
+            raise RuntimeError("Missing GATE_API_KEY or GATE_API_SECRET")
+        ts = str(int(time.time()))
+        hashed_payload = hashlib.sha512(b"").hexdigest()
+        sign_str = f"GET\n/api/v4{path}\n{query_string}\n{hashed_payload}\n{ts}"
+        signature = hmac.new(
+            GATE_API_SECRET.encode("utf-8"),
+            sign_str.encode("utf-8"),
+            hashlib.sha512,
+        ).hexdigest()
+        headers = {
+            "Accept": "application/json",
+            "KEY": GATE_API_KEY,
+            "Timestamp": ts,
+            "SIGN": signature,
+        }
+        url = f"{GATE_BASE}{path}" + (f"?{query_string}" if query_string else "")
+        async with self.session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Gate GET {path} {resp.status}: {text[:200]}")
+            return json.loads(text)
+
     async def signed_post(self, path: str, body: Dict[str, Any]) -> Any:
         if not GATE_API_KEY or not GATE_API_SECRET:
             raise RuntimeError("Missing GATE_API_KEY or GATE_API_SECRET")
@@ -272,6 +324,19 @@ class GateClient:
             if resp.status >= 400:
                 raise RuntimeError(f"Gate POST {path} {resp.status}: {text[:200]}")
             return json.loads(text)
+
+    async def get_usdt_futures_account(self) -> Dict[str, float]:
+        data = await self.signed_get("/futures/usdt/accounts")
+        if not isinstance(data, dict):
+            raise RuntimeError("Unexpected Gate.io futures account payload")
+        available = float(data.get("available") or 0.0)
+        total = float(data.get("total") or 0.0)
+        unrealised = float(data.get("unrealised_pnl") or 0.0)
+        return {
+            "available": available,
+            "total": total,
+            "unrealised_pnl": unrealised,
+        }
 
 
 def round_to_step(val: float, step: float) -> float:
@@ -534,6 +599,7 @@ class StatArbBot:
 
     async def send_startup_notification(self) -> None:
         async with self.store.lock:
+            self.store.roll_daily_pnl_if_needed()
             state = self.store.state
             cfg = state.get("config", {})
             mode = "PAPER (DRY_RUN)" if cfg.get("DRY_RUN", True) else "LIVE TRADING"
@@ -556,6 +622,7 @@ class StatArbBot:
 
     async def _build_pinned_card_html(self) -> str:
         async with self.store.lock:
+            self.store.roll_daily_pnl_if_needed()
             state = self.store.state
             cfg = state.get("config", {})
             positions = state.get("positions", [])
@@ -566,6 +633,7 @@ class StatArbBot:
             alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
             equity = float(state.get("sim_equity", INITIAL_EQUITY))
             r_pnl = float(state.get("realized_pnl", 0.0))
+            d_pnl = float(state.get("daily_realized_pnl", 0.0))
             wins = int(state.get("wins", 0))
             losses = int(state.get("losses", 0))
             max_pos = int(cfg.get("MAX_POSITIONS", 3))
@@ -575,7 +643,7 @@ class StatArbBot:
         lines = [
             f"📌 <b>STATARB LIVE CARD</b> ({run_state} | <b>{mode}</b>)",
             f"<b>Equity:</b> <code>{equity:.2f} USDT</code> | <b>Alerts:</b> <code>{alerts_state}</code>",
-            f"<b>Realized:</b> <code>{r_pnl:+.2f}</code> | <b>Unrealized:</b> <code>{u_pnl:+.2f} USDT</code>",
+            f"<b>Daily:</b> <code>{d_pnl:+.2f}</code> | <b>Realized:</b> <code>{r_pnl:+.2f}</code> | <b>Open:</b> <code>{u_pnl:+.2f}</code>",
             f"<b>Record:</b> <code>{wins}W / {losses}L</code> | <b>Slots:</b> <code>{len(positions)}/{max_pos}</code>",
         ]
 
@@ -769,9 +837,20 @@ class StatArbBot:
         qty_x: float,
         reduce_only: bool,
         dry_run: bool,
+        required_margin_usdt: float = 0.0,
     ) -> None:
         if dry_run:
             return
+
+        if not reduce_only:
+            acct = await self.gate.get_usdt_futures_account()
+            available = float(acct.get("available") or 0.0)
+            needed = max(0.0, required_margin_usdt) * 1.05
+            if available < needed:
+                raise RuntimeError(
+                    f"Insufficient Gate.io USDT available margin ({available:.2f} < {needed:.2f} USDT)"
+                )
+
         if not reduce_only:
             dir_y = 1 if side == "LONG_SPREAD" else -1
             dir_x = -1 if side == "LONG_SPREAD" else 1
@@ -826,12 +905,7 @@ class StatArbBot:
 
                 pnl = float(pos.get("unrealizedPnl") or 0.0)
                 total_pnl += pnl
-                state["realized_pnl"] = float(state.get("realized_pnl", 0.0)) + pnl
-                state["sim_equity"] = float(state.get("sim_equity", INITIAL_EQUITY)) + pnl
-                if pnl >= 0:
-                    state["wins"] = int(state.get("wins", 0)) + 1
-                else:
-                    state["losses"] = int(state.get("losses", 0)) + 1
+                self.store.record_realized_pnl(pnl, ts_exit)
 
                 state["trades"] = [
                     {
@@ -873,6 +947,7 @@ class StatArbBot:
     async def run_tick(self) -> None:
         alerts: List[str] = []
         async with self.store.lock:
+            self.store.roll_daily_pnl_if_needed()
             cfg = dict(self.store.state["config"])
 
         try:
@@ -887,6 +962,7 @@ class StatArbBot:
             return
 
         async with self.store.lock:
+            self.store.roll_daily_pnl_if_needed()
             state = self.store.state
             cfg = state["config"]
             state["last_tick_ts"] = now_ms()
@@ -899,6 +975,7 @@ class StatArbBot:
             max_positions = int(cfg["MAX_POSITIONS"])
             notional_usdt = float(cfg["NOTIONAL_USDT"])
             dry_run = bool(cfg["DRY_RUN"])
+            max_daily_loss = float(cfg.get("MAX_DAILY_LOSS_USDT", 50.0))
 
             remaining_positions: List[Dict[str, Any]] = []
             now = now_ms()
@@ -967,12 +1044,7 @@ class StatArbBot:
                     except Exception as exc:
                         self.store.add_event("ERROR", f"Live exit failed {pos['pair']}: {exc}")
 
-                    state["realized_pnl"] = float(state.get("realized_pnl", 0.0)) + net_pnl
-                    state["sim_equity"] = float(state.get("sim_equity", INITIAL_EQUITY)) + net_pnl
-                    if net_pnl >= 0:
-                        state["wins"] = int(state.get("wins", 0)) + 1
-                    else:
-                        state["losses"] = int(state.get("losses", 0)) + 1
+                    self.store.record_realized_pnl(net_pnl, now)
 
                     state["trades"] = [
                         {
@@ -1023,7 +1095,12 @@ class StatArbBot:
             candidates.sort(key=lambda x: x["score"], reverse=True)
             state["ranked_pairs"] = candidates[:50]
 
-            if not state.get("paused", False) and len(state["positions"]) < max_positions:
+            daily_loss_hit = (
+                max_daily_loss > 0.0
+                and float(state.get("daily_realized_pnl", 0.0)) <= -max_daily_loss
+            )
+
+            if not state.get("paused", False) and not daily_loss_hit and len(state["positions"]) < max_positions:
                 busy = set()
                 for p in state["positions"]:
                     busy.add(p["legY"])
@@ -1039,6 +1116,7 @@ class StatArbBot:
 
                     notional_y = notional_usdt
                     notional_x = notional_usdt * abs(float(cand["beta"]))
+                    total_pair_notional = notional_y + notional_x
                     ok_y, qty_y, err_y = size_contract_order(
                         cand["legY"], notional_y, float(cand["priceY"]), self.store.contracts_meta
                     )
@@ -1058,12 +1136,13 @@ class StatArbBot:
                             qty_x,
                             reduce_only=False,
                             dry_run=dry_run,
+                            required_margin_usdt=total_pair_notional,
                         )
                     except Exception as exc:
-                        self.store.add_event("ERROR", f"Live entry failed {cand['pair']}: {exc}")
+                        self.store.add_event("ERROR", f"Entry guard/order failed {cand['pair']}: {exc}")
                         continue
 
-                    init_fee = -(notional_y + notional_x) * TAKER_FEE * 2.0
+                    init_fee = -total_pair_notional * TAKER_FEE * 2.0
                     new_pos = {
                         "id": f"{now_ms()}_{cand['legY']}_{cand['legX']}",
                         "pair": cand["pair"],
@@ -1173,7 +1252,36 @@ class StatArbBot:
             await self.close_all_positions("TELEGRAM_CLOSEALL")
             return
 
+        if cmd == "/balance":
+            async with self.store.lock:
+                self.store.roll_daily_pnl_if_needed()
+                cfg = dict(self.store.state["config"])
+                sim_eq = float(self.store.state.get("sim_equity", INITIAL_EQUITY))
+                d_pnl = float(self.store.state.get("daily_realized_pnl", 0.0))
+
+            live_line = ""
+            if not cfg["DRY_RUN"]:
+                try:
+                    acct = await self.gate.get_usdt_futures_account()
+                    live_line = (
+                        f"\n<b>Gate USDT Available:</b> <code>{acct['available']:.2f} USDT</code> | "
+                        f"<b>Total:</b> <code>{acct['total']:.2f} USDT</code>"
+                    )
+                except Exception as exc:
+                    live_line = f"\n<b>Gate Account Check:</b> <code>{html.escape(str(exc))}</code>"
+
+            await self.send_telegram(
+                f"<b>Mode:</b> {'Paper (<code>DRY_RUN=true</code>)' if cfg['DRY_RUN'] else 'Live (<code>DRY_RUN=false</code>)'}\n"
+                f"<b>Equity:</b> <code>{sim_eq:.2f} USDT</code> | <b>Daily Realized:</b> <code>{d_pnl:+.2f} USDT</code>\n"
+                f"<b>Daily Loss Cap:</b> <code>{cfg['MAX_DAILY_LOSS_USDT']} USDT</code>\n"
+                f"<b>Leg Y Notional:</b> <code>{cfg['NOTIONAL_USDT']} USDT</code> | <b>Max Hold:</b> <code>{cfg['MAX_HOLD_MINUTES']}m</code>"
+                f"{live_line}",
+                chat_id,
+            )
+            return
+
         async with self.store.lock:
+            self.store.roll_daily_pnl_if_needed()
             state = self.store.state
             cfg = state["config"]
             defaults = get_env_config_defaults()
@@ -1182,11 +1290,13 @@ class StatArbBot:
                 u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in state.get("positions", []))
                 mode = "PAPER (DRY_RUN)" if cfg["DRY_RUN"] else "LIVE TRADING"
                 alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
+                d_pnl = float(state.get("daily_realized_pnl", 0.0))
                 reply = (
                     f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b> | Alerts: <code>{alerts_state}</code>\n"
                     f"<b>Positions:</b> <code>{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}</code> | "
                     f"<b>Z Entry/Exit/Stop:</b> <code>{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}</code>\n"
-                    f"<b>Unrealized PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
+                    f"<b>Daily Realized:</b> <code>{d_pnl:+.2f} USDT</code> (Cap: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code>) | "
+                    f"<b>Open PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
                     f"<b>Last Tick:</b> {html.escape(fmt_ist(state.get('last_tick_ts')))}"
                 )
                 if state.get("last_error"):
@@ -1195,7 +1305,8 @@ class StatArbBot:
             elif cmd == "/pnl":
                 u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in state.get("positions", []))
                 reply = (
-                    f"<b>Realized PnL:</b> <code>{float(state.get('realized_pnl', 0.0)):+.2f} USDT</code>\n"
+                    f"<b>Daily Realized PnL:</b> <code>{float(state.get('daily_realized_pnl', 0.0)):+.2f} USDT</code>\n"
+                    f"<b>Total Realized PnL:</b> <code>{float(state.get('realized_pnl', 0.0)):+.2f} USDT</code>\n"
                     f"<b>Unrealized PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
                     f"<b>Equity:</b> <code>{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT</code>\n"
                     f"<b>Record:</b> <code>{state.get('wins', 0)}W / {state.get('losses', 0)}L</code>"
@@ -1219,18 +1330,12 @@ class StatArbBot:
                     )
                 reply = "\n".join(lines) if lines else "No closed trades yet."
 
-            elif cmd == "/balance":
-                reply = (
-                    f"<b>Mode:</b> {'Paper (<code>DRY_RUN=true</code>)' if cfg['DRY_RUN'] else 'Live (<code>DRY_RUN=false</code>)'}\n"
-                    f"<b>Equity:</b> <code>{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT</code>\n"
-                    f"<b>Leg Y Notional:</b> <code>{cfg['NOTIONAL_USDT']} USDT</code> | <b>Max Hold:</b> <code>{cfg['MAX_HOLD_MINUTES']}m</code>"
-                )
-
             elif cmd == "/config":
                 rows = ["<b>Active Runtime Configuration:</b>"]
                 for key in [
                     "DRY_RUN",
                     "TRADE_ALERTS",
+                    "MAX_DAILY_LOSS_USDT",
                     "TOP_N_COINS",
                     "LOOKBACK",
                     "MAX_POSITIONS",
@@ -1310,6 +1415,24 @@ class StatArbBot:
                             reply = "🚨 <code>DRY_RUN</code> set to <code>False</code> (<b>LIVE TRADING ENABLED</b>)."
                     else:
                         reply = "Send <code>/setdryrun true</code> or <code>/setdryrun false confirm</code>."
+
+            elif cmd == "/setdailyloss":
+                if not arg1:
+                    reply = (
+                        f"Current <code>MAX_DAILY_LOSS_USDT</code>: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code> USDT (0 = off). "
+                        f"Example: <code>/setdailyloss 25</code>"
+                    )
+                else:
+                    try:
+                        val = float(arg1)
+                        if not (0.0 <= val <= 100000.0):
+                            raise ValueError
+                        cfg["MAX_DAILY_LOSS_USDT"] = round(val, 2)
+                        self.store.add_event("CONFIG", f"MAX_DAILY_LOSS_USDT updated to {cfg['MAX_DAILY_LOSS_USDT']}")
+                        await self.store.save()
+                        reply = f"✅ <code>MAX_DAILY_LOSS_USDT</code> updated to <code>{cfg['MAX_DAILY_LOSS_USDT']}</code> USDT."
+                    except ValueError:
+                        reply = f"Enter USDT from 0 to 100000 (current: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code>). Example: <code>/setdailyloss 25</code>"
 
             elif cmd == "/settopn":
                 if not arg1:
@@ -1681,6 +1804,7 @@ function renderState(s) {
     " | Lookback: " + (cfg.LOOKBACK || 100) +
     " | Z (In/Out/Stop): " + cfg.Z_ENTRY + "/" + cfg.Z_EXIT + "/" + cfg.Z_STOP +
     " | Notional: $" + cfg.NOTIONAL_USDT +
+    " | Daily Cap: $" + (cfg.MAX_DAILY_LOSS_USDT ?? 50) +
     " | Last Tick: " + fmtIST(s.last_tick_ts);
 
   const btn = document.getElementById("btnTogglePause");
@@ -1690,11 +1814,11 @@ function renderState(s) {
   const uPnl = (s.positions || []).reduce((acc, p) => acc + (Number(p.unrealizedPnl) || 0), 0);
   const kpis = [
     ["Equity (USDT)", Number(s.sim_equity || 0).toFixed(2), ""],
-    ["Realized PnL", (s.realized_pnl >= 0 ? "+" : "") + Number(s.realized_pnl || 0).toFixed(2), s.realized_pnl >= 0 ? "pos" : "neg"],
+    ["Daily PnL", (s.daily_realized_pnl >= 0 ? "+" : "") + Number(s.daily_realized_pnl || 0).toFixed(2), (s.daily_realized_pnl || 0) >= 0 ? "pos" : "neg"],
+    ["Total Realized", (s.realized_pnl >= 0 ? "+" : "") + Number(s.realized_pnl || 0).toFixed(2), (s.realized_pnl || 0) >= 0 ? "pos" : "neg"],
     ["Unrealized PnL", (uPnl >= 0 ? "+" : "") + uPnl.toFixed(2), uPnl >= 0 ? "pos" : "neg"],
     ["Win / Loss", (s.wins || 0) + "W / " + (s.losses || 0) + "L", ""],
-    ["Open Slots", (s.positions || []).length + " / " + (cfg.MAX_POSITIONS || 3), ""],
-    ["Max Hold", (cfg.MAX_HOLD_MINUTES || 720) + " min", ""]
+    ["Open Slots", (s.positions || []).length + " / " + (cfg.MAX_POSITIONS || 3), ""]
   ];
   document.getElementById("kpiCards").innerHTML = kpis.map(([k, v, cls]) =>
     '<div class="card"><div class="k">' + esc(k) + '</div><div class="v ' + cls + '">' + esc(v) + '</div></div>'
