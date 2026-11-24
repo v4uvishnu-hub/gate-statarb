@@ -78,24 +78,26 @@ class StatArbEngine:
             and adf_stat <= self.adf_threshold
             and self.min_half_life <= hl <= self.max_half_life
         )
+        z_now = float(z_series[-1])
+        entry_ready = bool(is_cointegrated and self.z_entry <= abs(z_now) < self.z_stop)
 
         return {
             "beta": float(beta),
-            "z_score": float(z_series[-1]),
+            "z_score": z_now,
             "z_history": [round(float(v), 3) for v in z_series[-40:]],
             "adf_stat": float(adf_stat),
             "half_life": float(hl) if np.isfinite(hl) else 999.0,
             "corr": float(corr),
             "is_cointegrated": bool(is_cointegrated),
+            "entry_ready": entry_ready,
             "price_y": float(df_y["close"].iloc[-1]),
             "price_x": float(df_x["close"].iloc[-1]),
         }
 
     def scan_universe(self, ohlcv_map: dict[str, pd.DataFrame], anchor_count: int = 8) -> list[dict]:
         """
-        Screens pairs across the top liquid coins.
-        Tests each coin against the top `anchor_count` most liquid leaders (BTC, ETH, SOL, etc.)
-        to keep O(N * anchor_count) fast (~750 pairs across 100 coins in <0.2s).
+        Screens top liquid coins against top `anchor_count` leaders.
+        Prioritizes pairs that meet BOTH cointegration AND entry Z-score criteria first.
         """
         symbols = list(ohlcv_map.keys())
         anchors = symbols[:anchor_count]
@@ -114,11 +116,14 @@ class StatArbEngine:
                 m = self.compute_metrics(ohlcv_map[y_sym], ohlcv_map[x_sym])
                 m["pair_y"] = y_sym
                 m["pair_x"] = x_sym
-                # Score rewards strong stationarity (negative ADF) + active |Z|
-                m["score"] = (-m["adf_stat"]) + min(abs(m["z_score"]), 3.5) * 0.4
+                m["score"] = (-m["adf_stat"]) + min(abs(m["z_score"]), 3.5) * 0.5
                 results.append(m)
 
-        results.sort(key=lambda r: (r["is_cointegrated"], r["score"]), reverse=True)
+        # Sort order: (1) Entry criteria met right now, (2) Cointegrated, (3) Composite score
+        results.sort(
+            key=lambda r: (r["entry_ready"], r["is_cointegrated"], r["score"]),
+            reverse=True,
+        )
         return results
 
     def get_signal(self, metrics: dict, side: str | None) -> str:
