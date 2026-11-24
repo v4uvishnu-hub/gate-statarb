@@ -3,5 +3,4 @@ python-telegram-bot
 aiohttp
 pandas
 numpy
-statsmodels
 python-dotenv
