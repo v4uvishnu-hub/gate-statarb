@@ -21,6 +21,7 @@ ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "3000"))
 
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 NOTIONAL_USDT = float(os.getenv("NOTIONAL_USDT", "100"))
 SIM_START_EQUITY = float(os.getenv("SIM_START_EQUITY", "1000"))
@@ -40,20 +41,14 @@ state = {
     "universe_count": 0,
     "active_pair_y": "ETH/USDT:USDT",
     "active_pair_x": "BTC/USDT:USDT",
-    "position": None,  # None | 'LONG_SPREAD' | 'SHORT_SPREAD'
-    "qty_y": 0.0,
-    "qty_x": 0.0,
-    "entry_y": 0.0,
-    "entry_x": 0.0,
-    "entry_z": 0.0,
-    "entry_time": None,
+    "positions": [],       # Up to MAX_POSITIONS active dicts
     "unrealized_pnl": 0.0,
     "sim_equity": SIM_START_EQUITY,
     "realized_pnl": 0.0,
     "wins": 0,
     "losses": 0,
-    "trades": [],      # Completed simulated/live trades
-    "top_pairs": [],   # Top screened cointegrated pairs
+    "trades": [],          # Completed simulated/live trades
+    "top_pairs": [],       # Top screened cointegrated pairs
     "metrics": {},
     "updated_at": None,
     "events": [],
@@ -81,18 +76,36 @@ def auth(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
 
-def compute_unrealized_pnl(price_y: float, price_x: float) -> float:
-    if not state["position"]:
-        return 0.0
-    if state["position"] == "LONG_SPREAD":
-        # Long Y, Short X
-        pnl_y = (price_y - state["entry_y"]) * state["qty_y"]
-        pnl_x = (state["entry_x"] - price_x) * state["qty_x"]
+def leg_unrealized_pnl(pos: dict, price_y: float, price_x: float) -> float:
+    if pos["side"] == "LONG_SPREAD":
+        pnl_y = (price_y - pos["entry_y"]) * pos["qty_y"]
+        pnl_x = (pos["entry_x"] - price_x) * pos["qty_x"]
     else:
-        # Short Y, Long X
-        pnl_y = (state["entry_y"] - price_y) * state["qty_y"]
-        pnl_x = (price_x - state["entry_x"]) * state["qty_x"]
+        pnl_y = (pos["entry_y"] - price_y) * pos["qty_y"]
+        pnl_x = (price_x - pos["entry_x"]) * pos["qty_x"]
     return float(pnl_y + pnl_x)
+
+
+def refresh_unrealized_pnl(ohlcv_map: dict[str, pd.DataFrame]):
+    total_u = 0.0
+    for pos in state["positions"]:
+        py, px = pos["pair_y"], pos["pair_x"]
+        if py in ohlcv_map and px in ohlcv_map:
+            cy = float(ohlcv_map[py]["close"].iloc[-1])
+            cx = float(ohlcv_map[px]["close"].iloc[-1])
+            pos["current_y"] = cy
+            pos["current_x"] = cx
+            pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, cy, cx), 3)
+        total_u += float(pos.get("unrealized_pnl", 0.0))
+    state["unrealized_pnl"] = float(total_u)
+
+
+def busy_symbols() -> set[str]:
+    used = set()
+    for pos in state["positions"]:
+        used.add(pos["pair_y"])
+        used.add(pos["pair_x"])
+    return used
 
 
 async def get_top_usdt_swaps(ex, limit: int = 100) -> list[str]:
@@ -110,7 +123,6 @@ async def get_top_usdt_swaps(ex, limit: int = 100) -> list[str]:
 
 
 async def fetch_ohlcv_universe(ex, symbols: list[str]) -> dict[str, pd.DataFrame]:
-    """Fetches OHLCV for top 100 symbols in controlled concurrent batches."""
     sem = asyncio.Semaphore(10)
     out: dict[str, pd.DataFrame] = {}
 
@@ -127,7 +139,7 @@ async def fetch_ohlcv_universe(ex, symbols: list[str]) -> dict[str, pd.DataFrame
     return out
 
 
-async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict):
+async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict:
     qy = float(ex.amount_to_precision(pair_y, NOTIONAL_USDT / m["price_y"]))
     qx = float(ex.amount_to_precision(pair_x, (NOTIONAL_USDT * abs(m["beta"])) / m["price_x"]))
     sy, sx = ("buy", "sell") if sig == "LONG_SPREAD" else ("sell", "buy")
@@ -142,27 +154,33 @@ async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict):
     state["sim_equity"] -= entry_fee
     state["realized_pnl"] -= entry_fee
 
-    state.update({
-        "active_pair_y": pair_y,
-        "active_pair_x": pair_x,
-        "position": sig,
+    pos_rec = {
+        "pair_y": pair_y,
+        "pair_x": pair_x,
+        "label": f"{pair_y.split('/')[0]}/{pair_x.split('/')[0]}",
+        "side": sig,
+        "side_y": sy,
+        "side_x": sx,
         "qty_y": qy,
         "qty_x": qx,
         "entry_y": m["price_y"],
         "entry_x": m["price_x"],
-        "entry_z": m["z_score"],
-        "entry_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "current_y": m["price_y"],
+        "current_x": m["price_x"],
+        "entry_z": round(m["z_score"], 2),
+        "current_z": round(m["z_score"], 2),
         "unrealized_pnl": 0.0,
-    })
-    return sy, sx, qy, qx
+        "entry_time": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
+    }
+    state["positions"].append(pos_rec)
+    state["active_pair_y"] = pair_y
+    state["active_pair_x"] = pair_x
+    return pos_rec
 
 
-async def close_spread(ex, price_y: float | None = None, price_x: float | None = None, exit_z: float = 0.0, reason: str = "SIGNAL"):
-    if not state["position"]:
-        return None
-    py = state["active_pair_y"]
-    px = state["active_pair_x"]
-    sy, sx = ("sell", "buy") if state["position"] == "LONG_SPREAD" else ("buy", "sell")
+async def close_single_position(ex, pos: dict, price_y: float | None = None, price_x: float | None = None, exit_z: float = 0.0, reason: str = "SIGNAL") -> dict:
+    py, px = pos["pair_y"], pos["pair_x"]
+    sy, sx = ("sell", "buy") if pos["side"] == "LONG_SPREAD" else ("buy", "sell")
 
     if price_y is None or price_x is None:
         ty, tx = await asyncio.gather(ex.fetch_ticker(py), ex.fetch_ticker(px))
@@ -171,12 +189,12 @@ async def close_spread(ex, price_y: float | None = None, price_x: float | None =
 
     if not DRY_RUN:
         await asyncio.gather(
-            ex.create_market_order(py, sy, state["qty_y"], params={"reduceOnly": True}),
-            ex.create_market_order(px, sx, state["qty_x"], params={"reduceOnly": True}),
+            ex.create_market_order(py, sy, pos["qty_y"], params={"reduceOnly": True}),
+            ex.create_market_order(px, sx, pos["qty_x"], params={"reduceOnly": True}),
         )
 
-    gross_pnl = compute_unrealized_pnl(price_y, price_x)
-    exit_fee = (state["qty_y"] * price_y + state["qty_x"] * price_x) * TAKER_FEE_RATE
+    gross_pnl = leg_unrealized_pnl(pos, price_y, price_x)
+    exit_fee = (pos["qty_y"] * price_y + pos["qty_x"] * price_x) * TAKER_FEE_RATE
     net_pnl = gross_pnl - exit_fee
 
     state["sim_equity"] += net_pnl
@@ -188,27 +206,27 @@ async def close_spread(ex, price_y: float | None = None, price_x: float | None =
 
     trade_rec = {
         "time": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
-        "pair": f"{py.split('/')[0]}/{px.split('/')[0]}",
-        "side": state["position"],
-        "entry_z": round(state["entry_z"], 2),
-        "exit_z": round(exit_z, 2),
+        "pair": pos["label"],
+        "side": pos["side"],
+        "entry_z": pos["entry_z"],
+        "exit_z": round(exit_z if exit_z else pos.get("current_z", 0.0), 2),
         "pnl": round(net_pnl, 3),
         "reason": reason,
     }
     state["trades"].insert(0, trade_rec)
-    state["trades"] = state["trades"][:30]
+    state["trades"] = state["trades"][:40]
 
-    state.update({
-        "position": None,
-        "qty_y": 0.0,
-        "qty_x": 0.0,
-        "entry_y": 0.0,
-        "entry_x": 0.0,
-        "entry_z": 0.0,
-        "entry_time": None,
-        "unrealized_pnl": 0.0,
-    })
+    state["positions"] = [p for p in state["positions"] if p is not pos]
     return trade_rec
+
+
+async def close_all_positions(ex, reason: str = "MANUAL") -> list[dict]:
+    closed = []
+    for pos in list(state["positions"]):
+        tr = await close_single_position(ex, pos, reason=reason)
+        closed.append(tr)
+    state["unrealized_pnl"] = 0.0
+    return closed
 
 
 # ---------------- Web Dashboard & API ----------------
@@ -221,7 +239,7 @@ DASHBOARD_HTML = """<!doctype html>
   <title>Gate.io Top-100 Stat-Arb Simulator</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-    .wrap { max-width: 1020px; margin: 0 auto; }
+    .wrap { max-width: 1080px; margin: 0 auto; }
     .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 12px; flex-wrap: wrap; }
     .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
     .live { background: #065f46; color: #6ee7b7; }
@@ -233,19 +251,19 @@ DASHBOARD_HTML = """<!doctype html>
     .btn-pause { border-color: #d97706; color: #fcd34d; }
     .btn-resume { border-color: #059669; color: #6ee7b7; }
     .btn-close { border-color: #dc2626; color: #fca5a5; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 12px; margin-bottom: 18px; }
     .card { background: #1e293b; padding: 14px; border-radius: 10px; border: 1px solid #334155; }
     .label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
     .val { font-size: 20px; font-weight: 700; }
     .pos-green { color: #4ade80; }
     .neg-red { color: #f87171; }
-    svg { width: 100%; height: 130px; background: #1e293b; border-radius: 10px; border: 1px solid #334155; margin-bottom: 18px; }
+    svg { width: 100%; height: 125px; background: #1e293b; border-radius: 10px; border: 1px solid #334155; margin-bottom: 18px; }
     .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 18px; }
-    @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
-    table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; font-size: 13px; border: 1px solid #334155; }
+    @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+    table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; font-size: 13px; border: 1px solid #334155; margin-bottom: 16px; }
     th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #334155; }
     th { color: #94a3b8; font-weight: 600; background: #162032; }
-    ul { list-style: none; padding: 12px; margin: 0; background: #1e293b; border-radius: 10px; border: 1px solid #334155; font-family: monospace; font-size: 12px; max-height: 220px; overflow-y: auto; }
+    ul { list-style: none; padding: 12px; margin: 0; background: #1e293b; border-radius: 10px; border: 1px solid #334155; font-family: monospace; font-size: 12px; max-height: 210px; overflow-y: auto; }
     li { padding: 4px 0; border-bottom: 1px solid #334155; }
     li:last-child { border-bottom: none; }
   </style>
@@ -254,7 +272,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="wrap">
   <div class="top">
     <div>
-      <h2 style="margin:0">Gate.io Top-100 Stat-Arb</h2>
+      <h2 style="margin:0">Gate.io Top-100 Stat-Arb (Max 3 Pairs)</h2>
       <small id="pair" style="color:#94a3b8">Scanning top 100 coins...</small>
     </div>
     <span id="mode" class="badge dry">SIMULATOR</span>
@@ -267,12 +285,18 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="grid">
     <div class="card"><div class="label">Sim Equity (USDT)</div><div class="val" id="eq">1000.00</div></div>
     <div class="card"><div class="label">Realized / Unrealized</div><div class="val" id="pnl">0.00 / 0.00</div></div>
-    <div class="card"><div class="label">Active Z-Score</div><div class="val" id="z">-</div></div>
-    <div class="card"><div class="label">Position</div><div class="val" id="pos">FLAT</div></div>
+    <div class="card"><div class="label">Open Pairs</div><div class="val" id="openCount">0 / 3</div></div>
+    <div class="card"><div class="label">Focus Z-Score</div><div class="val" id="z">-</div></div>
     <div class="card"><div class="label">Win / Loss</div><div class="val" id="wl">0 / 0</div></div>
     <div class="card"><div class="label">Universe Scanned</div><div class="val" id="univ">0</div></div>
   </div>
-  <svg id="chart" viewBox="0 0 600 130" preserveAspectRatio="none"></svg>
+  <svg id="chart" viewBox="0 0 600 125" preserveAspectRatio="none"></svg>
+
+  <h4 style="margin:0 0 8px 0;color:#94a3b8">Open Positions</h4>
+  <table>
+    <thead><tr><th>Pair</th><th>Side</th><th>Entry Z</th><th>Now Z</th><th>Unrealized ($)</th><th>Opened</th></tr></thead>
+    <tbody id="openPos"><tr><td colspan="6">No open positions</td></tr></tbody>
+  </table>
 
   <div class="cols">
     <div>
@@ -303,34 +327,39 @@ function drawChart(pts, entry) {
   const svg = document.getElementById('chart');
   if (!pts || pts.length < 2) return;
   const maxZ = Math.max(3.5, entry + 0.5, ...pts.map(Math.abs));
-  const toY = z => 65 - (z / maxZ) * 55;
+  const toY = z => 62 - (z / maxZ) * 52;
   const step = 600 / (pts.length - 1);
   const d = pts.map((z, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${toY(z).toFixed(1)}`).join(' ');
   svg.innerHTML = `
-    <line x1="0" y1="65" x2="600" y2="65" stroke="#475569" stroke-dasharray="4" />
+    <line x1="0" y1="62" x2="600" y2="62" stroke="#475569" stroke-dasharray="4" />
     <line x1="0" y1="${toY(entry)}" x2="600" y2="${toY(entry)}" stroke="#ef4444" stroke-dasharray="3" />
     <line x1="0" y1="${toY(-entry)}" x2="600" y2="${toY(-entry)}" stroke="#22c55e" stroke-dasharray="3" />
     <path d="${d}" fill="none" stroke="#38bdf8" stroke-width="2.5" />
   `;
 }
 function applyState(s) {
-  document.getElementById('pair').textContent = `Active: ${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.running ? 'RUNNING' : 'PAUSED'}`;
+  const posList = s.positions || [];
+  document.getElementById('pair').textContent = `Focus: ${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.running ? 'RUNNING' : 'PAUSED'}`;
   const badge = document.getElementById('mode');
   badge.textContent = s.dry_run ? 'SIMULATED PAPER' : 'LIVE TRADING';
   badge.className = 'badge ' + (s.dry_run ? 'dry' : 'live');
   document.getElementById('eq').textContent = s.sim_equity.toFixed(2);
   document.getElementById('pnl').innerHTML = `${fmtPnl(s.realized_pnl)} / ${fmtPnl(s.unrealized_pnl)}`;
-  document.getElementById('pos').textContent = s.position || 'FLAT';
+  document.getElementById('openCount').textContent = `${posList.length} / ${s.max_positions}`;
   document.getElementById('wl').textContent = `${s.wins} / ${s.losses}`;
   document.getElementById('univ').textContent = `${s.universe_count} coins`;
   document.getElementById('btnPause').disabled = !s.running;
   document.getElementById('btnResume').disabled = s.running;
-  document.getElementById('btnClose').disabled = !s.position;
+  document.getElementById('btnClose').disabled = posList.length === 0;
 
   if (s.metrics && s.metrics.z_score !== undefined) {
     document.getElementById('z').textContent = `${s.metrics.z_score.toFixed(2)} (±${s.z_entry.toFixed(1)})`;
     drawChart(s.metrics.z_history, s.z_entry);
   }
+  document.getElementById('openPos').innerHTML = posList.length
+    ? posList.map(p => `<tr><td><b>${p.label}</b></td><td>${p.side.replace('_SPREAD','')}</td><td>${p.entry_z}</td><td>${p.current_z}</td><td>${fmtPnl(p.unrealized_pnl)}</td><td>${p.entry_time}</td></tr>`).join('')
+    : '<tr><td colspan="6">No open positions</td></tr>';
+
   if (s.top_pairs && s.top_pairs.length) {
     document.getElementById('topPairs').innerHTML = s.top_pairs.map(p =>
       `<tr><td>${p.pair_y.split('/')[0]}/${p.pair_x.split('/')[0]}</td><td>${p.z_score.toFixed(2)}</td><td>${p.beta.toFixed(2)}</td><td>${p.adf_stat.toFixed(2)}</td><td>${p.half_life.toFixed(0)}b</td></tr>`
@@ -346,7 +375,7 @@ function applyState(s) {
   }
 }
 async function sendAction(action) {
-  if (action === 'closeall' && !confirm('Close active simulated/live legs now?')) return;
+  if (action === 'closeall' && !confirm('Close ALL open positions now?')) return;
   ['btnPause', 'btnResume', 'btnClose'].forEach(id => document.getElementById(id).disabled = true);
   try {
     const r = await fetch(`/api/${action}`, { method: 'POST' });
@@ -374,17 +403,18 @@ def snapshot_state() -> dict:
         "running": state["running"],
         "dry_run": DRY_RUN,
         "universe_count": state["universe_count"],
+        "max_positions": MAX_POSITIONS,
         "pair_y": state["active_pair_y"],
         "pair_x": state["active_pair_x"],
         "timeframe": TIMEFRAME,
-        "position": state["position"],
+        "positions": state["positions"],
         "z_entry": engine.z_entry,
         "sim_equity": state["sim_equity"],
         "realized_pnl": state["realized_pnl"],
         "unrealized_pnl": state["unrealized_pnl"],
         "wins": state["wins"],
         "losses": state["losses"],
-        "trades": state["trades"][:10],
+        "trades": state["trades"][:12],
         "top_pairs": state["top_pairs"][:8],
         "metrics": state["metrics"],
         "updated_at": state["updated_at"],
@@ -419,9 +449,10 @@ async def handle_api_resume(request: web.Request):
 async def handle_api_closeall(request: web.Request):
     ex = make_exchange()
     try:
-        tr = await close_spread(ex, reason="MANUAL_WEB")
-        if tr:
-            add_event(f"Manual Web Close {tr['pair']} | Net PnL: {tr['pnl']:+.2f} USDT")
+        closed = await close_all_positions(ex, reason="MANUAL_WEB")
+        if closed:
+            total_p = sum(t["pnl"] for t in closed)
+            add_event(f"Closed {len(closed)} position(s) via Web | Net PnL: {total_p:+.2f} USDT")
         return web.json_response({"ok": True, "state": snapshot_state()})
     finally:
         await ex.close()
@@ -447,15 +478,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
     m = state["metrics"]
-    if not m:
-        await update.message.reply_text("Scanning top 100 Gate.io coins, try again in a few seconds...")
-        return
+    pos_lines = [
+        f"• {p['label']} ({p['side']}): Z {p['entry_z']}→{p['current_z']} | uPnL {p['unrealized_pnl']:+.2f}"
+        for p in state["positions"]
+    ]
+    pos_block = "\n".join(pos_lines) if pos_lines else "None (FLAT)"
+    z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | ADF: {m['adf_stat']:.2f}" if m else "Scanning..."
     await update.message.reply_text(
         f"Mode: {'SIMULATOR' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'}\n"
-        f"Universe: {state['universe_count']} coins ({TIMEFRAME})\n"
-        f"Active: {state['active_pair_y']} vs {state['active_pair_x']}\n"
-        f"Pos: {state['position'] or 'FLAT'} | Unrealized: {state['unrealized_pnl']:+.2f} USDT\n"
-        f"Z: {m['z_score']:.2f} (Entry: ±{engine.z_entry:.2f}) | Beta: {m['beta']:.3f} | ADF: {m['adf_stat']:.2f}"
+        f"Open Pairs: {len(state['positions'])}/{MAX_POSITIONS} | Total uPnL: {state['unrealized_pnl']:+.2f} USDT\n"
+        f"Focus ({state['active_pair_y'].split('/')[0]}/{state['active_pair_x'].split('/')[0]}): {z_txt}\n"
+        f"Positions:\n{pos_block}"
     )
 
 
@@ -553,8 +586,12 @@ async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ex = make_exchange()
     try:
-        tr = await close_spread(ex, reason="MANUAL_TG")
-        msg = f"Closed {tr['pair']} | Net PnL: {tr['pnl']:+.2f} USDT" if tr else "No active position."
+        closed = await close_all_positions(ex, reason="MANUAL_TG")
+        if not closed:
+            await update.message.reply_text("No active positions.")
+            return
+        total_p = sum(t["pnl"] for t in closed)
+        msg = f"Closed {len(closed)} position(s) | Net PnL: {total_p:+.2f} USDT"
         add_event(msg)
         await update.message.reply_text(msg)
     finally:
@@ -565,8 +602,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
     await update.message.reply_text(
-        "Commands:\n"
-        "/status - Active pair, Z-score, beta, unrealized PnL\n"
+        f"Commands (Max {MAX_POSITIONS} simultaneous pairs):\n"
+        "/status - Open positions, Z-score, unrealized PnL\n"
         "/pnl - Simulated equity, realized PnL, win/loss stats\n"
         "/top - Top cointegrated pairs from Top-100 scan\n"
         "/trades - Recent simulated trade history\n"
@@ -586,20 +623,19 @@ async def tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error(f"Telegram error: {context.error}", exc_info=context.error)
 
 
-# ---------------- Top-100 Trading & Simulation Loop ----------------
+# ---------------- Multi-Pair Top-100 Trading Loop ----------------
 
 async def trader_loop(tg_app: Application):
     ex = make_exchange()
     await ex.load_markets()
     top_symbols = await get_top_usdt_swaps(ex, TOP_N_COINS)
     state["universe_count"] = len(top_symbols)
-    add_event(f"Loaded Top {len(top_symbols)} Gate.io USDT Perpetuals")
+    add_event(f"Loaded Top {len(top_symbols)} Gate.io USDT Perpetuals (Max {MAX_POSITIONS} pairs)")
     cycle = 0
 
     try:
         while True:
             try:
-                # Refresh top 100 liquidity ranking every 20 cycles
                 if cycle > 0 and cycle % 20 == 0:
                     top_symbols = await get_top_usdt_swaps(ex, TOP_N_COINS)
                     state["universe_count"] = len(top_symbols)
@@ -610,53 +646,68 @@ async def trader_loop(tg_app: Application):
                 state["top_pairs"] = ranked_pairs[:15]
                 state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-                # 1. Manage existing position first
-                if state["position"]:
-                    py, px = state["active_pair_y"], state["active_pair_x"]
+                # 1. Evaluate & update all open positions
+                for pos in list(state["positions"]):
+                    py, px = pos["pair_y"], pos["pair_x"]
                     if py in ohlcv_map and px in ohlcv_map:
                         m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
-                        state["metrics"] = m
-                        state["unrealized_pnl"] = compute_unrealized_pnl(m["price_y"], m["price_x"])
+                        pos["current_z"] = round(m["z_score"], 2)
+                        pos["current_y"] = m["price_y"]
+                        pos["current_x"] = m["price_x"]
+                        pos["unrealized_pnl"] = round(leg_unrealized_pnl(pos, m["price_y"], m["price_x"]), 3)
 
-                        if state["running"]:
-                            sig = engine.get_signal(m, state["position"])
-                            if sig == "CLOSE":
-                                reason = "STOP_LOSS" if abs(m["z_score"]) >= engine.z_stop else "MEAN_REVERT"
-                                tr = await close_spread(ex, m["price_y"], m["price_x"], m["z_score"], reason=reason)
-                                msg = (
-                                    f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']})\n"
-                                    f"Z: {tr['entry_z']} → {tr['exit_z']} | Net PnL: {tr['pnl']:+.2f} USDT\n"
-                                    f"Sim Equity: {state['sim_equity']:.2f} USDT"
-                                )
-                                add_event(f"CLOSED {tr['pair']} {tr['pnl']:+.2f} USDT ({reason})")
-                                await tg_app.bot.send_message(ADMIN_ID, msg)
+                        if state["running"] and engine.get_signal(m, pos["side"]) == "CLOSE":
+                            reason = "STOP_LOSS" if abs(m["z_score"]) >= engine.z_stop else "MEAN_REVERT"
+                            tr = await close_single_position(
+                                ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason
+                            )
+                            msg = (
+                                f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']})\n"
+                                f"Z: {tr['entry_z']} → {tr['exit_z']} | Net PnL: {tr['pnl']:+.2f} USDT\n"
+                                f"Sim Equity: {state['sim_equity']:.2f} USDT"
+                            )
+                            add_event(f"CLOSED {tr['pair']} {tr['pnl']:+.2f} USDT ({reason})")
+                            await tg_app.bot.send_message(ADMIN_ID, msg)
 
-                # 2. Scan for best new simulated entry if flat
-                else:
-                    best = ranked_pairs[0] if ranked_pairs else None
-                    if best:
-                        state["active_pair_y"] = best["pair_y"]
-                        state["active_pair_x"] = best["pair_x"]
-                        state["metrics"] = best
+                refresh_unrealized_pnl(ohlcv_map)
 
-                    if state["running"]:
-                        for cand in ranked_pairs:
-                            sig = engine.get_signal(cand, None)
-                            if sig in ("LONG_SPREAD", "SHORT_SPREAD"):
-                                sy, sx, qy, qx = await open_spread(
-                                    ex, cand["pair_y"], cand["pair_x"], sig, cand
-                                )
-                                state["metrics"] = cand
-                                pair_lbl = f"{cand['pair_y'].split('/')[0]}/{cand['pair_x'].split('/')[0]}"
-                                msg = (
-                                    f"[SIM OPENED] {sig} on {pair_lbl}\n"
-                                    f"Z: {cand['z_score']:+.2f} | Beta: {cand['beta']:.3f} | ADF: {cand['adf_stat']:.2f}\n"
-                                    f"{sy.upper()} {qy} {cand['pair_y']} @ {cand['price_y']}\n"
-                                    f"{sx.upper()} {qx} {cand['pair_x']} @ {cand['price_x']}"
-                                )
-                                add_event(f"OPENED {sig} {pair_lbl} @ Z={cand['z_score']:+.2f}")
-                                await tg_app.bot.send_message(ADMIN_ID, msg)
-                                break
+                # 2. Update chart focus (first open pair or top ranked pair)
+                if state["positions"]:
+                    focus = state["positions"][0]
+                    py, px = focus["pair_y"], focus["pair_x"]
+                    state["active_pair_y"], state["active_pair_x"] = py, px
+                    if py in ohlcv_map and px in ohlcv_map:
+                        state["metrics"] = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
+                elif ranked_pairs:
+                    best = ranked_pairs[0]
+                    state["active_pair_y"], state["active_pair_x"] = best["pair_y"], best["pair_x"]
+                    state["metrics"] = best
+
+                # 3. Open new positions up to MAX_POSITIONS (3) without overlapping symbols
+                if state["running"] and len(state["positions"]) < MAX_POSITIONS:
+                    used = busy_symbols()
+                    for cand in ranked_pairs:
+                        if len(state["positions"]) >= MAX_POSITIONS:
+                            break
+                        if cand["pair_y"] in used or cand["pair_x"] in used:
+                            continue
+                        sig = engine.get_signal(cand, None)
+                        if sig in ("LONG_SPREAD", "SHORT_SPREAD"):
+                            pos_rec = await open_spread(
+                                ex, cand["pair_y"], cand["pair_x"], sig, cand
+                            )
+                            used.add(cand["pair_y"])
+                            used.add(cand["pair_x"])
+                            state["active_pair_y"], state["active_pair_x"] = cand["pair_y"], cand["pair_x"]
+                            state["metrics"] = cand
+                            msg = (
+                                f"[SIM OPENED {len(state['positions'])}/{MAX_POSITIONS}] {sig} on {pos_rec['label']}\n"
+                                f"Z: {cand['z_score']:+.2f} | Beta: {cand['beta']:.3f} | ADF: {cand['adf_stat']:.2f}\n"
+                                f"{pos_rec['side_y'].upper()} {pos_rec['qty_y']} {cand['pair_y']} @ {cand['price_y']}\n"
+                                f"{pos_rec['side_x'].upper()} {pos_rec['qty_x']} {cand['pair_x']} @ {cand['price_x']}"
+                            )
+                            add_event(f"OPENED {sig} {pos_rec['label']} @ Z={cand['z_score']:+.2f}")
+                            await tg_app.bot.send_message(ADMIN_ID, msg)
 
             except Exception as e:
                 log.error(f"Loop error: {e}", exc_info=True)
