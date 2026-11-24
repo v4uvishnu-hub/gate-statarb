@@ -26,6 +26,12 @@ GATE_BASE = "https://api.gateio.ws/api/v4"
 STATE_FILE = "bot_state.json"
 REDIS_STATE_KEY = "gate_statarb:state_v1"
 
+PIN_REPLY_MARKUP: Dict[str, Any] = {
+    "inline_keyboard": [
+        [{"text": "🔄 Refresh", "callback_data": "pin_refresh"}]
+    ]
+}
+
 HELP_TEXT_HTML = (
     "<b>Gate.io Top-100 Stat-Arb Admin Commands</b>\n"
     "Tap any command below:\n\n"
@@ -466,6 +472,7 @@ class StatArbBot:
         chat_id: Optional[str] = None,
         parse_mode: Optional[str] = "HTML",
         allow_when_muted: bool = True,
+        reply_markup: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
         if not allow_when_muted:
             async with self.store.lock:
@@ -481,6 +488,8 @@ class StatArbBot:
         payload: Dict[str, Any] = {"chat_id": target, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         try:
             async with self.session.post(
                 url,
@@ -496,6 +505,7 @@ class StatArbBot:
                             chat_id=target,
                             parse_mode=None,
                             allow_when_muted=allow_when_muted,
+                            reply_markup=reply_markup,
                         )
                     return None
                 data = json.loads(body)
@@ -503,6 +513,24 @@ class StatArbBot:
         except Exception as exc:
             log.warning("Telegram send error: %s", exc)
             return None
+
+    async def answer_callback_query(self, callback_query_id: str, text: str = "Refreshed") -> None:
+        if not TELEGRAM_BOT_TOKEN or not callback_query_id:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        try:
+            async with self.session.post(
+                url,
+                json={
+                    "callback_query_id": callback_query_id,
+                    "text": text[:180],
+                    "show_alert": False,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                await resp.read()
+        except Exception as exc:
+            log.warning("answerCallbackQuery error: %s", exc)
 
     async def _build_pinned_card_html(self) -> str:
         async with self.store.lock:
@@ -600,8 +628,6 @@ class StatArbBot:
             return "TELEGRAM_ADMIN_ID is not configured."
 
         if not force_new and msg_id:
-            if card_text == self._last_pin_text:
-                return f"Pinned card is already up to date (message #{msg_id})."
             edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
             try:
                 async with self.session.post(
@@ -611,6 +637,7 @@ class StatArbBot:
                         "message_id": msg_id,
                         "text": card_text,
                         "parse_mode": "HTML",
+                        "reply_markup": PIN_REPLY_MARKUP,
                     },
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
@@ -625,7 +652,12 @@ class StatArbBot:
             except Exception as exc:
                 log.warning("editMessageText error: %s; creating fresh pinned card", exc)
 
-        new_msg_id = await self.send_telegram(card_text, chat_id=target_chat, parse_mode="HTML")
+        new_msg_id = await self.send_telegram(
+            card_text,
+            chat_id=target_chat,
+            parse_mode="HTML",
+            reply_markup=PIN_REPLY_MARKUP,
+        )
         if not new_msg_id:
             return "Failed to send pinned dashboard card."
 
@@ -1057,6 +1089,22 @@ class StatArbBot:
             await self.send_telegram(msg, allow_when_muted=False)
 
     async def process_telegram_update(self, update: Dict[str, Any]) -> None:
+        cb = update.get("callback_query") or {}
+        if cb:
+            cb_id = str(cb.get("id") or "")
+            cb_data = str(cb.get("data") or "").strip()
+            cb_user = str((cb.get("from") or {}).get("id") or "")
+            cb_chat = str(((cb.get("message") or {}).get("chat") or {}).get("id") or cb_user)
+            if not TELEGRAM_ADMIN_ID or cb_user != TELEGRAM_ADMIN_ID:
+                await self.answer_callback_query(cb_id, "Unauthorized")
+                return
+            if cb_data == "pin_refresh":
+                status_msg = await self.sync_pinned_dashboard(force_new=False, chat_override=cb_chat)
+                await self.answer_callback_query(cb_id, status_msg)
+            else:
+                await self.answer_callback_query(cb_id, "Done")
+            return
+
         msg = update.get("message") or {}
         text = str(msg.get("text") or "").strip()
         user_id = str((msg.get("from") or {}).get("id") or "")
@@ -1400,7 +1448,11 @@ class StatArbBot:
         while True:
             try:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-                params = {"offset": self.tg_offset, "timeout": 25}
+                params = {
+                    "offset": self.tg_offset,
+                    "timeout": 25,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                }
                 async with self.session.get(
                     url, params=params, timeout=aiohttp.ClientTimeout(total=35)
                 ) as resp:
