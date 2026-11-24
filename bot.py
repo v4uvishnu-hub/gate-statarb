@@ -6,7 +6,7 @@ import ccxt.async_support as ccxt
 from aiohttp import web
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from strategy import StatArbEngine
 
 load_dotenv()
@@ -71,7 +71,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Mode: {'DRY' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'}\n"
         f"Pair: {PAIR_Y} vs {PAIR_X} ({TIMEFRAME})\n"
         f"Pos: {state['position'] or 'FLAT'}\n"
-        f"Z: {m['z_score']:.2f} | Beta: {m['beta']:.3f} | ADF: {m['adf_stat']:.2f}"
+        f"Z: {m['z_score']:.2f} (Entry: ±{engine.z_entry:.2f}) | Beta: {m['beta']:.3f} | ADF: {m['adf_stat']:.2f}"
     )
 
 
@@ -97,6 +97,20 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ex.close()
 
 
+async def cmd_setz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+    try:
+        val = float(context.args[0])
+        if val <= 0 or val >= engine.z_stop:
+            await update.message.reply_text(f"Enter a value greater than 0 and less than {engine.z_stop}.")
+            return
+        engine.z_entry = val
+        await update.message.reply_text(f"Z-score entry threshold set to ±{val:.2f}")
+    except (IndexError, ValueError):
+        await update.message.reply_text(f"Usage: /setz 2.2 (Current: ±{engine.z_entry:.2f})")
+
+
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
@@ -120,6 +134,27 @@ async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Closed all legs.")
     finally:
         await ex.close()
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+    await update.message.reply_text(
+        "Available commands:\n"
+        "/status - Show Z-score, entry threshold, beta, ADF, and position\n"
+        "/balance - Check Gate.io USDT futures balance\n"
+        "/setz <val> - Set Z-score entry threshold (e.g. /setz 2.2)\n"
+        "/pause - Pause new trade entries\n"
+        "/resume - Resume trading loop\n"
+        "/closeall - Close active spread legs\n"
+        "/help - Show this command list"
+    )
+
+
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+    await update.message.reply_text("Unknown command. Send /help.")
 
 
 async def start_web():
@@ -176,9 +211,12 @@ def main():
     tg_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("balance", cmd_balance))
+    tg_app.add_handler(CommandHandler("setz", cmd_setz))
     tg_app.add_handler(CommandHandler("pause", cmd_pause))
     tg_app.add_handler(CommandHandler("resume", cmd_resume))
     tg_app.add_handler(CommandHandler("closeall", cmd_closeall))
+    tg_app.add_handler(CommandHandler("help", cmd_help))
+    tg_app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     tg_app.run_polling(drop_pending_updates=True)
 
 
