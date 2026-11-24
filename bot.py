@@ -313,16 +313,16 @@ DASHBOARD_HTML = """<!doctype html>
     .btn-pause { border-color: #d97706; color: #fcd34d; }
     .btn-resume { border-color: #059669; color: #6ee7b7; }
     .btn-close { border-color: #dc2626; color: #fca5a5; }
-    .ist-clock { margin-left: auto; font-family: monospace; font-size: 13px; color: #94a3b8; }
+    .status-meta { margin-left: auto; display: flex; gap: 14px; align-items: center; font-family: monospace; font-size: 13px; color: #94a3b8; flex-wrap: wrap; }
+    .refresh-pill { background: #1e293b; border: 1px solid #334155; color: #38bdf8; padding: 4px 10px; border-radius: 6px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 12px; margin-bottom: 18px; }
     .card { background: #1e293b; padding: 14px; border-radius: 10px; border: 1px solid #334155; }
     .label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
     .val { font-size: 20px; font-weight: 700; }
     .pos-green { color: #4ade80; }
     .neg-red { color: #f87171; }
-    svg { width: 100%; height: 125px; background: #1e293b; border-radius: 10px; border: 1px solid #334155; margin-bottom: 18px; }
     .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 18px; }
-    @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+    @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } .status-meta { margin-left: 0; } }
     table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; font-size: 13px; border: 1px solid #334155; margin-bottom: 16px; }
     th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #334155; }
     th { color: #94a3b8; font-weight: 600; background: #162032; }
@@ -344,7 +344,10 @@ DASHBOARD_HTML = """<!doctype html>
     <button id="btnPause" class="btn-pause" onclick="sendAction('pause')">Pause</button>
     <button id="btnResume" class="btn-resume" onclick="sendAction('resume')">Resume</button>
     <button id="btnClose" class="btn-close" onclick="sendAction('closeall')">Close All</button>
-    <span id="istClock" class="ist-clock">IST: --:--:--</span>
+    <div class="status-meta">
+      <span id="refreshTimer" class="refresh-pill">Refresh in: 3s</span>
+      <span id="istClock">IST: --:--:--</span>
+    </div>
   </div>
   <div class="grid">
     <div class="card"><div class="label">Sim Equity (USDT)</div><div class="val" id="eq">1000.00</div></div>
@@ -354,7 +357,6 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">Win / Loss</div><div class="val" id="wl">0 / 0</div></div>
     <div class="card"><div class="label">Scan Speed</div><div class="val" id="univ">-</div></div>
   </div>
-  <svg id="chart" viewBox="0 0 600 125" preserveAspectRatio="none"></svg>
 
   <h4 style="margin:0 0 8px 0;color:#94a3b8">Open Positions</h4>
   <table>
@@ -383,11 +385,15 @@ DASHBOARD_HTML = """<!doctype html>
   <ul id="events"><li>Starting fast scan...</li></ul>
 </div>
 <script>
+const REFRESH_INTERVAL_SEC = 3;
+let remainingSec = REFRESH_INTERVAL_SEC;
+
 function fmtPnl(v) {
   const cls = v > 0 ? 'pos-green' : (v < 0 ? 'neg-red' : '');
   return `<span class="${cls}">${v >= 0 ? '+' : ''}${v.toFixed(2)}</span>`;
 }
-function updateIstClock() {
+
+function updateClockAndTimer() {
   const istStr = new Date().toLocaleTimeString('en-IN', {
     timeZone: 'Asia/Kolkata',
     hour12: false,
@@ -396,21 +402,9 @@ function updateIstClock() {
     second: '2-digit'
   });
   document.getElementById('istClock').textContent = `IST: ${istStr}`;
+  document.getElementById('refreshTimer').textContent = `Refresh in: ${Math.max(0, remainingSec)}s`;
 }
-function drawChart(pts, entry) {
-  const svg = document.getElementById('chart');
-  if (!pts || pts.length < 2) return;
-  const maxZ = Math.max(3.5, entry + 0.5, ...pts.map(Math.abs));
-  const toY = z => 62 - (z / maxZ) * 52;
-  const step = 600 / (pts.length - 1);
-  const d = pts.map((z, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${toY(z).toFixed(1)}`).join(' ');
-  svg.innerHTML = `
-    <line x1="0" y1="62" x2="600" y2="62" stroke="#475569" stroke-dasharray="4" />
-    <line x1="0" y1="${toY(entry)}" x2="600" y2="${toY(entry)}" stroke="#ef4444" stroke-dasharray="3" />
-    <line x1="0" y1="${toY(-entry)}" x2="600" y2="${toY(-entry)}" stroke="#22c55e" stroke-dasharray="3" />
-    <path d="${d}" fill="none" stroke="#38bdf8" stroke-width="2.5" />
-  `;
-}
+
 function applyState(s) {
   const posList = s.positions || [];
   document.getElementById('pair').textContent = `Focus: ${s.pair_y} vs ${s.pair_x} (${s.timeframe}) • ${s.scan_status}`;
@@ -427,9 +421,6 @@ function applyState(s) {
   document.getElementById('btnResume').disabled = s.running;
   document.getElementById('btnClose').disabled = posList.length === 0;
 
-  if (s.metrics && s.metrics.z_history) {
-    drawChart(s.metrics.z_history, s.z_entry);
-  }
   document.getElementById('openPos').innerHTML = posList.length
     ? posList.map(p => `<tr><td><b>${p.label}</b></td><td>${p.side.replace('_SPREAD','')}</td><td>${p.entry_z}</td><td>${p.current_z}</td><td>${fmtPnl(p.unrealized_pnl)}</td><td>${p.entry_time}</td></tr>`).join('')
     : '<tr><td colspan="6">No open positions</td></tr>';
@@ -451,6 +442,7 @@ function applyState(s) {
     document.getElementById('events').innerHTML = s.events.map(e => `<li>${e}</li>`).join('');
   }
 }
+
 async function sendAction(action) {
   if (action === 'closeall' && !confirm('Close ALL open positions now?')) return;
   ['btnPause', 'btnResume', 'btnClose'].forEach(id => document.getElementById(id).disabled = true);
@@ -459,20 +451,27 @@ async function sendAction(action) {
     const d = await r.json();
     if (d.state) applyState(d.state);
   } finally {
+    remainingSec = REFRESH_INTERVAL_SEC;
     await refresh();
   }
 }
+
 async function refresh() {
-  updateIstClock();
   try {
     const r = await fetch('/api/state');
     applyState(await r.json());
   } catch (e) {}
+  remainingSec = REFRESH_INTERVAL_SEC;
+  updateClockAndTimer();
 }
-updateIstClock();
-setInterval(updateIstClock, 1000);
+
+updateClockAndTimer();
 refresh();
-setInterval(refresh, 3000);
+setInterval(() => {
+  remainingSec = Math.max(0, remainingSec - 1);
+  updateClockAndTimer();
+}, 1000);
+setInterval(refresh, REFRESH_INTERVAL_SEC * 1000);
 </script>
 </body>
 </html>"""
