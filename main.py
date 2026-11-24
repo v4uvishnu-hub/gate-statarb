@@ -25,7 +25,6 @@ GATE_BASE = "https://api.gateio.ws/api/v4"
 STATE_FILE = "bot_state.json"
 REDIS_STATE_KEY = "gate_statarb:state_v1"
 
-# --- Default Configuration & Validation Bounds ---
 
 def env_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -87,8 +86,6 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# --- Persistent State Manager (Redis + JSON Fallback) ---
-
 class StateStore:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
@@ -123,7 +120,12 @@ class StateStore:
     async def init(self) -> None:
         if REDIS_URL:
             try:
-                self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+                self.redis_client = redis.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                )
                 await self.redis_client.ping()
                 log.info("Connected to Redis for persistent state")
             except Exception as exc:
@@ -190,8 +192,6 @@ class StateStore:
         if self.redis_client is not None:
             await self.redis_client.aclose()
 
-
-# --- Gate.io API v4 Client ---
 
 class GateClient:
     def __init__(self, session: aiohttp.ClientSession) -> None:
@@ -275,8 +275,6 @@ def format_order_size_field(qty: float, signed_dir: int) -> Any:
         return int(round(signed))
     return str(round(signed, 8))
 
-
-# --- Statistical Arbitrage Math Engine ---
 
 def adf_t_stat(spread: np.ndarray) -> float:
     n = len(spread) - 1
@@ -419,8 +417,6 @@ def evaluate_pair(
         "score": float(score),
     }
 
-
-# --- Core Bot Controller ---
 
 class StatArbBot:
     def __init__(self, store: StateStore, gate: GateClient, session: aiohttp.ClientSession) -> None:
@@ -639,7 +635,6 @@ class StatArbBot:
             notional_usdt = float(cfg["NOTIONAL_USDT"])
             dry_run = bool(cfg["DRY_RUN"])
 
-            # 1. Evaluate open positions and process exits
             remaining_positions: List[Dict[str, Any]] = []
             now = now_ms()
             for pos in state.get("positions", []):
@@ -748,7 +743,6 @@ class StatArbBot:
 
             state["positions"] = remaining_positions
 
-            # 2. Rank cointegrated pairs across liquid pool
             valid_syms = [s for s in universe if len(self.store.candle_cache.get(s, [])) >= 35][:CANDIDATE_POOL_LIMIT]
             candidates: List[Dict[str, Any]] = []
             for i in range(len(valid_syms)):
@@ -764,7 +758,6 @@ class StatArbBot:
             candidates.sort(key=lambda x: x["score"], reverse=True)
             state["ranked_pairs"] = candidates[:50]
 
-            # 3. Open new positions if unpaused and slots + non-overlapping symbols permit
             if not state.get("paused", False) and len(state["positions"]) < max_positions:
                 busy = set()
                 for p in state["positions"]:
@@ -851,8 +844,6 @@ class StatArbBot:
         for msg in alerts:
             await self.send_telegram(msg)
 
-    # --- Telegram Command Processor (All 9 Editable Parameters + Controls) ---
-
     async def process_telegram_update(self, update: Dict[str, Any]) -> None:
         msg = update.get("message") or {}
         text = str(msg.get("text") or "").strip()
@@ -885,7 +876,7 @@ class StatArbBot:
                 "`/setz <0.5-6.0>` - Set `Z_ENTRY`\n"
                 "`/setzexit <0.0-3.0>` - Set `Z_EXIT`\n"
                 "`/setzstop <1.5-10.0>` - Set `Z_STOP`\n"
-                "`/resetconfig` - Reset all 9 parameters to env defaults\n"
+                "`/resetconfig` - Reset all 9 parameters to defaults\n"
                 "`/pause` | `/resume` | `/closeall`",
                 chat_id,
             )
@@ -965,9 +956,9 @@ class StatArbBot:
 
             elif cmd == "/resetconfig":
                 state["config"] = get_env_config_defaults()
-                self.store.add_event("CONFIG", "All 9 runtime parameters reset to env defaults via Telegram")
+                self.store.add_event("CONFIG", "All 9 runtime parameters reset to defaults via Telegram")
                 await self.store.save()
-                reply = "✅ All 9 parameters reset to Voroa environment defaults."
+                reply = "✅ All 9 parameters reset to built-in defaults."
 
             elif cmd == "/pause":
                 state["paused"] = True
@@ -1115,7 +1106,6 @@ class StatArbBot:
         if not TELEGRAM_BOT_TOKEN:
             log.info("TELEGRAM_BOT_TOKEN not set; Telegram polling disabled")
             return
-        # Ensure webhook is cleared so getUpdates long-polling receives messages cleanly
         try:
             async with self.session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
@@ -1157,8 +1147,6 @@ class StatArbBot:
                 log.exception("Scanner tick error: %s", exc)
             await asyncio.sleep(SCAN_INTERVAL_SEC)
 
-
-# --- Live IST Web Dashboard (No SVG Charts, 3s Poll + Countdown, Remaining Hold Bars) ---
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1473,8 +1461,6 @@ fetchState();
 </html>
 """
 
-
-# --- Web Application Wiring & Entrypoint ---
 
 async def main() -> None:
     session = aiohttp.ClientSession()
