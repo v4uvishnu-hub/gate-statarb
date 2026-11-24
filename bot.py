@@ -3,8 +3,10 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
+import numpy as np
 import pandas as pd
 import ccxt.async_support as ccxt
+import redis.asyncio as aioredis
 from aiohttp import web, ClientSession, ClientTimeout
 from dotenv import load_dotenv
 from telegram import Update
@@ -33,9 +35,14 @@ TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0005"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
+# Local fallback + Redis persistence
 PERSIST_STATE = os.getenv("PERSIST_STATE", "true").lower() == "true"
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
+
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_STATE_KEY = os.getenv("REDIS_STATE_KEY", "gate_arb:state:v1").strip()
+_redis_client: aioredis.Redis | None = None
 
 GATE_FUTURES_BASE = "https://api.gateio.ws/api/v4/futures/usdt"
 
@@ -76,76 +83,140 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def save_state():
+def redis_enabled() -> bool:
+    return bool(REDIS_URL)
+
+
+def get_redis() -> aioredis.Redis | None:
+    global _redis_client
+    if not REDIS_URL:
+        return None
+    if _redis_client is None:
+        _redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
+def build_state_payload() -> dict:
+    return {
+        "saved_at_ist": now_ist().isoformat(),
+        "running": state["running"],
+        "z_entry": engine.z_entry,
+        "active_pair_y": state["active_pair_y"],
+        "active_pair_x": state["active_pair_x"],
+        "positions": state["positions"],
+        "sim_equity": state["sim_equity"],
+        "realized_pnl": state["realized_pnl"],
+        "wins": state["wins"],
+        "losses": state["losses"],
+        "trades": state["trades"],
+        "events": state["events"],
+    }
+
+
+def apply_saved_payload(saved: dict, source_label: str):
+    if not isinstance(saved, dict) or not saved:
+        return
+    state["running"] = bool(saved.get("running", True))
+    if "z_entry" in saved:
+        engine.z_entry = float(saved["z_entry"])
+    state["active_pair_y"] = saved.get("active_pair_y", state["active_pair_y"])
+    state["active_pair_x"] = saved.get("active_pair_x", state["active_pair_x"])
+    state["positions"] = list(saved.get("positions", []))
+    state["sim_equity"] = float(saved.get("sim_equity", SIM_START_EQUITY))
+    state["realized_pnl"] = float(saved.get("realized_pnl", 0.0))
+    state["wins"] = int(saved.get("wins", 0))
+    state["losses"] = int(saved.get("losses", 0))
+    state["trades"] = list(saved.get("trades", []))
+    state["events"] = list(saved.get("events", []))
+    state["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0)) for p in state["positions"])
+    log.info(
+        f"Restored state from {source_label}: {len(state['positions'])} open pos, "
+        f"{len(state['trades'])} trades, equity={state['sim_equity']:.2f}"
+    )
+
+
+def save_local_state(payload: dict):
     if not PERSIST_STATE:
         return
     try:
         parent = os.path.dirname(STATE_FILE)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        payload = {
-            "running": state["running"],
-            "z_entry": engine.z_entry,
-            "active_pair_y": state["active_pair_y"],
-            "active_pair_x": state["active_pair_x"],
-            "positions": state["positions"],
-            "sim_equity": state["sim_equity"],
-            "realized_pnl": state["realized_pnl"],
-            "wins": state["wins"],
-            "losses": state["losses"],
-            "trades": state["trades"],
-            "events": state["events"],
-        }
         tmp_path = f"{STATE_FILE}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         os.replace(tmp_path, STATE_FILE)
     except Exception as e:
-        log.error(f"Failed to save state to {STATE_FILE}: {e}")
+        log.error(f"Failed to save local state to {STATE_FILE}: {e}")
 
 
-def load_state():
+def load_local_state() -> bool:
     if not PERSIST_STATE or RESET_STATE:
         if RESET_STATE and os.path.exists(STATE_FILE):
             try:
                 os.remove(STATE_FILE)
-                log.info(f"RESET_STATE=true: removed {STATE_FILE}")
-            except Exception as e:
-                log.warning(f"Could not remove {STATE_FILE}: {e}")
-        return
+            except Exception:
+                pass
+        return False
     if not os.path.exists(STATE_FILE):
-        log.info(f"No saved state at {STATE_FILE}; starting fresh.")
-        return
+        return False
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
-        state["running"] = bool(saved.get("running", True))
-        if "z_entry" in saved:
-            engine.z_entry = float(saved["z_entry"])
-        state["active_pair_y"] = saved.get("active_pair_y", state["active_pair_y"])
-        state["active_pair_x"] = saved.get("active_pair_x", state["active_pair_x"])
-        state["positions"] = list(saved.get("positions", []))
-        state["sim_equity"] = float(saved.get("sim_equity", SIM_START_EQUITY))
-        state["realized_pnl"] = float(saved.get("realized_pnl", 0.0))
-        state["wins"] = int(saved.get("wins", 0))
-        state["losses"] = int(saved.get("losses", 0))
-        state["trades"] = list(saved.get("trades", []))
-        state["events"] = list(saved.get("events", []))
-        state["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0)) for p in state["positions"])
-        log.info(
-            f"Restored state from {STATE_FILE}: {len(state['positions'])} open pos, "
-            f"{len(state['trades'])} trades, equity={state['sim_equity']:.2f}"
-        )
+        if isinstance(saved, dict) and ("positions" in saved or "trades" in saved or "sim_equity" in saved):
+            apply_saved_payload(saved, f"local:{STATE_FILE}")
+            return True
     except Exception as e:
-        log.error(f"Failed to load state from {STATE_FILE}: {e}")
+        log.error(f"Failed to load local state from {STATE_FILE}: {e}")
+    return False
 
 
-def add_event(msg: str, persist: bool = True):
+async def save_redis_state(payload: dict):
+    client = get_redis()
+    if not client:
+        return
+    try:
+        await client.set(REDIS_STATE_KEY, json.dumps(payload))
+        log.info(f"Saved state to Redis key '{REDIS_STATE_KEY}'")
+    except Exception as e:
+        log.error(f"Redis save failed: {e}")
+
+
+async def load_redis_state() -> bool:
+    client = get_redis()
+    if not client:
+        return False
+    try:
+        if RESET_STATE:
+            await client.delete(REDIS_STATE_KEY)
+            log.info(f"RESET_STATE=true: deleted Redis key '{REDIS_STATE_KEY}'")
+            return False
+        raw = await client.get(REDIS_STATE_KEY)
+        if not raw:
+            return False
+        saved = json.loads(raw)
+        if isinstance(saved, dict) and ("positions" in saved or "trades" in saved or "sim_equity" in saved):
+            apply_saved_payload(saved, f"redis:{REDIS_STATE_KEY}")
+            save_local_state(saved)
+            return True
+    except Exception as e:
+        log.error(f"Redis load failed: {e}")
+    return False
+
+
+async def persist_now(sync_remote: bool = False):
+    payload = build_state_payload()
+    save_local_state(payload)
+    if sync_remote and redis_enabled():
+        await save_redis_state(payload)
+
+
+def add_event(msg: str, persist: bool = False, sync_remote: bool = False):
     ts = now_ist().strftime("%H:%M:%S IST")
     state["events"].insert(0, f"[{ts}] {msg}")
     state["events"] = state["events"][:25]
-    if persist:
-        save_state()
+    if persist or sync_remote:
+        asyncio.create_task(persist_now(sync_remote=sync_remote))
 
 
 def make_exchange():
@@ -179,7 +250,6 @@ def leg_unrealized_pnl(pos: dict, price_y: float, price_x: float) -> float:
 
 
 def compute_position_live_edge(pos: dict, m: dict, cy: float, cx: float) -> tuple[float, float]:
-    """Remaining expected edge (%) and USDT toward z_exit net of exit fees."""
     z_now = float(m["z_score"])
     spread_std = float(m.get("spread_std") or 0.01)
     if pos["side"] == "LONG_SPREAD":
@@ -364,11 +434,19 @@ async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict |
     state["positions"].append(pos_rec)
     state["active_pair_y"] = pair_y
     state["active_pair_x"] = pair_x
-    save_state()
+    await persist_now(sync_remote=True)
     return pos_rec
 
 
-async def close_single_position(ex, pos: dict, price_y: float | None = None, price_x: float | None = None, exit_z: float = 0.0, reason: str = "SIGNAL") -> dict:
+async def close_single_position(
+    ex,
+    pos: dict,
+    price_y: float | None = None,
+    price_x: float | None = None,
+    exit_z: float = 0.0,
+    reason: str = "SIGNAL",
+    sync_remote: bool = True,
+) -> dict:
     py, px = pos["pair_y"], pos["pair_x"]
     sy, sx = ("sell", "buy") if pos["side"] == "LONG_SPREAD" else ("buy", "sell")
 
@@ -408,17 +486,18 @@ async def close_single_position(ex, pos: dict, price_y: float | None = None, pri
     state["trades"] = state["trades"][:40]
 
     state["positions"] = [p for p in state["positions"] if p is not pos]
-    save_state()
+    if sync_remote:
+        await persist_now(sync_remote=True)
     return trade_rec
 
 
 async def close_all_positions(ex, reason: str = "MANUAL") -> list[dict]:
     closed = []
     for pos in list(state["positions"]):
-        tr = await close_single_position(ex, pos, reason=reason)
+        tr = await close_single_position(ex, pos, reason=reason, sync_remote=False)
         closed.append(tr)
     state["unrealized_pnl"] = 0.0
-    save_state()
+    await persist_now(sync_remote=True)
     return closed
 
 
@@ -713,6 +792,7 @@ def snapshot_state() -> dict:
     return {
         "running": state["running"],
         "persist_state": PERSIST_STATE,
+        "redis_enabled": redis_enabled(),
         "state_file": STATE_FILE,
         "max_hold_min": MAX_HOLD_MINUTES,
         "scan_status": state["scan_status"],
@@ -744,7 +824,7 @@ async def handle_dashboard(request: web.Request):
 
 
 async def handle_health(request: web.Request):
-    return web.json_response({"status": "ok"})
+    return web.json_response({"status": "ok", "redis": redis_enabled()})
 
 
 async def handle_api_state(request: web.Request):
@@ -754,12 +834,14 @@ async def handle_api_state(request: web.Request):
 async def handle_api_pause(request: web.Request):
     state["running"] = False
     add_event("Paused via Web Dashboard")
+    await persist_now(sync_remote=True)
     return web.json_response({"ok": True, "state": snapshot_state()})
 
 
 async def handle_api_resume(request: web.Request):
     state["running"] = True
     add_event("Resumed via Web Dashboard")
+    await persist_now(sync_remote=True)
     return web.json_response({"ok": True, "state": snapshot_state()})
 
 
@@ -770,6 +852,7 @@ async def handle_api_closeall(request: web.Request):
         if closed:
             total_p = sum(t["pnl"] for t in closed)
             add_event(f"Closed {len(closed)} position(s) via Web | Net PnL: {total_p:+.2f} USDT")
+            await persist_now(sync_remote=True)
         return web.json_response({"ok": True, "state": snapshot_state()})
     finally:
         await ex.close()
@@ -803,7 +886,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pos_block = "\n".join(pos_lines) if pos_lines else "None (FLAT)"
     z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | Edge {m.get('edge_pct',0):+.2f}% | ADF: {m['adf_stat']:.2f}" if m else state["scan_status"]
     await update.message.reply_text(
-        f"Mode: {'SIMULATOR' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'}\n"
+        f"Mode: {'SIMULATOR' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'} | Redis: {'ON' if redis_enabled() else 'OFF'}\n"
         f"Scan: {state['universe_count']} coins in {state['last_scan_sec']}s ({state['ready_count']} entry-ready)\n"
         f"Open Pairs: {len(state['positions'])}/{MAX_POSITIONS} | Total uPnL: {state['unrealized_pnl']:+.2f} USDT\n"
         f"Focus ({state['active_pair_y'].split('/')[0]}/{state['active_pair_x'].split('/')[0]}): {z_txt}\n"
@@ -879,10 +962,11 @@ async def cmd_setz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = float(context.args[0])
         if val <= 0 or val >= engine.z_stop:
-            await update.message.reply_text(f"Enter a value > 0 and < {engine.z_stop}.")
+            await update.message.reply_text(f"Enter a value greater than 0 and less than {engine.z_stop}.")
             return
         engine.z_entry = val
         add_event(f"Z-entry updated to ±{val:.2f}")
+        await persist_now(sync_remote=True)
         await update.message.reply_text(f"Z-score entry threshold set to ±{val:.2f}")
     except (IndexError, ValueError):
         await update.message.reply_text(f"Usage: /setz 2.0 (Current: ±{engine.z_entry:.2f})")
@@ -893,6 +977,7 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state["running"] = False
     add_event("Paused via Telegram")
+    await persist_now(sync_remote=True)
     await update.message.reply_text("Paused.")
 
 
@@ -901,6 +986,7 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state["running"] = True
     add_event("Resumed via Telegram")
+    await persist_now(sync_remote=True)
     await update.message.reply_text("Resumed.")
 
 
@@ -916,6 +1002,7 @@ async def cmd_closeall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_p = sum(t["pnl"] for t in closed)
         msg = f"Closed {len(closed)} position(s) | Net PnL: {total_p:+.2f} USDT"
         add_event(msg)
+        await persist_now(sync_remote=True)
         await update.message.reply_text(msg)
     finally:
         await ex.close()
@@ -984,7 +1071,6 @@ async def trader_loop(tg_app: Application):
                             f"Scan started in {elapsed}s ({len(ohlcv_map)} coins, {len(state['positions'])} open pos restored)"
                         )
 
-                    # Refresh metrics, edge, uPnL, and timers for all open positions
                     for pos in list(state["positions"]):
                         py, px = pos["pair_y"], pos["pair_x"]
                         if py in ohlcv_map and px in ohlcv_map:
@@ -1013,7 +1099,7 @@ async def trader_loop(tg_app: Application):
                                 else:
                                     reason = "MEAN_REVERT"
                                 tr = await close_single_position(
-                                    ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason
+                                    ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason, sync_remote=True
                                 )
                                 msg = (
                                     f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']}) • {tr['time']} IST\n"
@@ -1077,12 +1163,14 @@ async def trader_loop(tg_app: Application):
 
 
 async def post_init(tg_app: Application):
+    loaded = await load_redis_state()
+    if not loaded:
+        load_local_state()
     await start_web()
     asyncio.create_task(trader_loop(tg_app))
 
 
 def main():
-    load_state()
     tg_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("pnl", cmd_pnl))
