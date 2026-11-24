@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import math
@@ -425,18 +426,28 @@ class StatArbBot:
         self.session = session
         self.tg_offset = 0
 
-    async def send_telegram(self, text: str, chat_id: Optional[str] = None) -> None:
+    async def send_telegram(
+        self, text: str, chat_id: Optional[str] = None, parse_mode: Optional[str] = "HTML"
+    ) -> None:
         target = chat_id or TELEGRAM_ADMIN_ID
         if not TELEGRAM_BOT_TOKEN or not target:
+            log.warning("Telegram alert skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_ADMIN_ID")
             return
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload: Dict[str, Any] = {"chat_id": target, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         try:
             async with self.session.post(
                 url,
-                json={"chat_id": target, "text": text, "parse_mode": "Markdown"},
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                await resp.read()
+                body = await resp.text()
+                if resp.status != 200:
+                    log.warning("Telegram sendMessage failed (%s): %s", resp.status, body[:250])
+                    if parse_mode is not None:
+                        await self.send_telegram(text, chat_id=target, parse_mode=None)
         except Exception as exc:
             log.warning("Telegram send error: %s", exc)
 
@@ -596,9 +607,9 @@ class StatArbBot:
             state["positions"] = []
             await self.store.save()
             alerts.append(
-                f"🛑 *Closed All Positions* (`{reason}`)\n"
-                f"Net Realized PnL: *{total_pnl:+.2f} USDT*\n"
-                f"Equity: *{state['sim_equity']:.2f} USDT*"
+                f"🛑 <b>Closed All Positions</b> (<code>{html.escape(reason)}</code>)\n"
+                f"Net Realized PnL: <b>{total_pnl:+.2f} USDT</b>\n"
+                f"Equity: <b>{state['sim_equity']:.2f} USDT</b>"
             )
 
         for msg in alerts:
@@ -734,9 +745,9 @@ class StatArbBot:
                         f"{pos['pair']} {pos['side']} exit [{exit_reason}] PnL {net_pnl:+.2f} USDT",
                     )
                     alerts.append(
-                        f"📤 *EXIT {pos['pair']}* ({pos['side']})\n"
-                        f"Reason: `{exit_reason}` | Z: `{z_now:.2f}`\n"
-                        f"PnL: *{net_pnl:+.2f} USDT* | Equity: *{state['sim_equity']:.2f} USDT*"
+                        f"📤 <b>EXIT {html.escape(pos['pair'])}</b> ({html.escape(pos['side'])})\n"
+                        f"Reason: <code>{html.escape(exit_reason)}</code> | Z: <code>{z_now:.2f}</code>\n"
+                        f"PnL: <b>{net_pnl:+.2f} USDT</b> | Equity: <b>{state['sim_equity']:.2f} USDT</b>"
                     )
                 else:
                     remaining_positions.append(pos)
@@ -834,9 +845,10 @@ class StatArbBot:
                         f"Opened {cand['pair']} {cand['signal']} Z={cand['zNow']:.2f} β={cand['beta']:.2f} qty={qty_y}/{qty_x}",
                     )
                     alerts.append(
-                        f"📥 *ENTRY {cand['pair']}* ({cand['signal']})\n"
-                        f"Z: `{cand['zNow']:.2f}` | β: `{cand['beta']:.2f}` | ADF: `{cand['adf']:.2f}` | HL: `{cand['halfLifeBars']}b`\n"
-                        f"Edge: *{cand['edgePct']:.2f}% ({cand['edgeUsdt']:.2f} USDT)*"
+                        f"📥 <b>ENTRY {html.escape(cand['pair'])}</b> ({html.escape(cand['signal'])})\n"
+                        f"Z: <code>{cand['zNow']:.2f}</code> | β: <code>{cand['beta']:.2f}</code> | "
+                        f"ADF: <code>{cand['adf']:.2f}</code> | HL: <code>{cand['halfLifeBars']}b</code>\n"
+                        f"Edge: <b>{cand['edgePct']:.2f}% ({cand['edgeUsdt']:.2f} USDT)</b>"
                     )
 
             await self.store.save()
@@ -860,24 +872,34 @@ class StatArbBot:
 
         if cmd in ("/help", "/start"):
             await self.send_telegram(
-                "*Gate.io Top-100 Stat-Arb Admin Commands*\n"
-                "`/status` - Bot state, mode, open slots & last IST tick\n"
-                "`/pnl` - Realized, unrealized PnL, equity & W/L record\n"
-                "`/top` - Top ranked cointegrated pairs & live Z-scores\n"
-                "`/trades` - Recent closed spread trades\n"
-                "`/balance` - Equity, notional & hold settings\n"
-                "`/config` - View all 9 editable runtime parameters\n"
-                "`/setdryrun <true|false> [confirm]` - Toggle paper/live mode\n"
-                "`/settopn <10-200>` - Set `TOP_N_COINS`\n"
-                "`/setlookback <30-300>` - Set `LOOKBACK`\n"
-                "`/setmaxpos <1-10>` - Set `MAX_POSITIONS`\n"
-                "`/setmaxhold <15-4320>` - Set `MAX_HOLD_MINUTES`\n"
-                "`/setnotional <10-10000>` - Set `NOTIONAL_USDT`\n"
-                "`/setz <0.5-6.0>` - Set `Z_ENTRY`\n"
-                "`/setzexit <0.0-3.0>` - Set `Z_EXIT`\n"
-                "`/setzstop <1.5-10.0>` - Set `Z_STOP`\n"
-                "`/resetconfig` - Reset all 9 parameters to defaults\n"
-                "`/pause` | `/resume` | `/closeall`",
+                "<b>Gate.io Top-100 Stat-Arb Admin Commands</b>\n"
+                "<code>/status</code> - Bot state, mode, open slots &amp; last IST tick\n"
+                "<code>/pnl</code> - Realized, unrealized PnL, equity &amp; W/L record\n"
+                "<code>/top</code> - Top ranked cointegrated pairs &amp; live Z-scores\n"
+                "<code>/trades</code> - Recent closed spread trades\n"
+                "<code>/balance</code> - Equity, notional &amp; hold settings\n"
+                "<code>/config</code> - View all 9 editable runtime parameters\n"
+                "<code>/setdryrun &lt;true|false&gt; [confirm]</code> - Toggle paper/live mode\n"
+                "<code>/settopn &lt;10-200&gt;</code> - Set TOP_N_COINS\n"
+                "<code>/setlookback &lt;30-300&gt;</code> - Set LOOKBACK\n"
+                "<code>/setmaxpos &lt;1-10&gt;</code> - Set MAX_POSITIONS\n"
+                "<code>/setmaxhold &lt;15-4320&gt;</code> - Set MAX_HOLD_MINUTES\n"
+                "<code>/setnotional &lt;10-10000&gt;</code> - Set NOTIONAL_USDT\n"
+                "<code>/setz &lt;0.5-6.0&gt;</code> - Set Z_ENTRY\n"
+                "<code>/setzexit &lt;0.0-3.0&gt;</code> - Set Z_EXIT\n"
+                "<code>/setzstop &lt;1.5-10.0&gt;</code> - Set Z_STOP\n"
+                "<code>/resetconfig</code> - Reset all 9 parameters to defaults\n"
+                "<code>/testalert</code> - Send a sample trade alert\n"
+                "<code>/pause</code> | <code>/resume</code> | <code>/closeall</code>",
+                chat_id,
+            )
+            return
+
+        if cmd == "/testalert":
+            await self.send_telegram(
+                f"📥 <b>TEST ENTRY {html.escape('BTC_USDT/ETH_USDT')}</b> (LONG_SPREAD)\n"
+                f"Z: <code>-2.15</code> | β: <code>1.04</code> | ADF: <code>-3.10</code> | HL: <code>18.5b</code>\n"
+                f"Edge: <b>0.42% (0.85 USDT)</b>",
                 chat_id,
             )
             return
@@ -895,30 +917,30 @@ class StatArbBot:
                 u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in state.get("positions", []))
                 mode = "PAPER (DRY_RUN)" if cfg["DRY_RUN"] else "LIVE TRADING"
                 reply = (
-                    f"*Status:* {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | *{mode}*\n"
-                    f"*Positions:* `{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}` | "
-                    f"*Z Entry/Exit/Stop:* `{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}`\n"
-                    f"*Unrealized PnL:* `{u_pnl:+.2f} USDT`\n"
-                    f"*Last Tick:* {fmt_ist(state.get('last_tick_ts'))}"
+                    f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b>\n"
+                    f"<b>Positions:</b> <code>{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}</code> | "
+                    f"<b>Z Entry/Exit/Stop:</b> <code>{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}</code>\n"
+                    f"<b>Unrealized PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
+                    f"<b>Last Tick:</b> {html.escape(fmt_ist(state.get('last_tick_ts')))}"
                 )
                 if state.get("last_error"):
-                    reply += f"\n*Last Error:* `{state['last_error']}`"
+                    reply += f"\n<b>Last Error:</b> <code>{html.escape(str(state['last_error']))}</code>"
 
             elif cmd == "/pnl":
                 u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in state.get("positions", []))
                 reply = (
-                    f"*Realized PnL:* `{float(state.get('realized_pnl', 0.0)):+.2f} USDT`\n"
-                    f"*Unrealized PnL:* `{u_pnl:+.2f} USDT`\n"
-                    f"*Equity:* `{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT`\n"
-                    f"*Record:* `{state.get('wins', 0)}W / {state.get('losses', 0)}L`"
+                    f"<b>Realized PnL:</b> <code>{float(state.get('realized_pnl', 0.0)):+.2f} USDT</code>\n"
+                    f"<b>Unrealized PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
+                    f"<b>Equity:</b> <code>{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT</code>\n"
+                    f"<b>Record:</b> <code>{state.get('wins', 0)}W / {state.get('losses', 0)}L</code>"
                 )
 
             elif cmd == "/top":
                 lines = []
                 for idx, p in enumerate(state.get("ranked_pairs", [])[:6], start=1):
                     lines.append(
-                        f"{idx}. *{p['pair']}* [{p['status']}] Z=`{p['zNow']:.2f}` "
-                        f"β=`{p['beta']:.2f}` ADF=`{p['adf']:.2f}` Edge=`{p['edgePct']:.2f}%`"
+                        f"{idx}. <b>{html.escape(p['pair'])}</b> [{html.escape(p['status'])}] Z=<code>{p['zNow']:.2f}</code> "
+                        f"β=<code>{p['beta']:.2f}</code> ADF=<code>{p['adf']:.2f}</code> Edge=<code>{p['edgePct']:.2f}%</code>"
                     )
                 reply = "\n".join(lines) if lines else "No ranked pairs yet. Wait for the first scan tick."
 
@@ -926,19 +948,20 @@ class StatArbBot:
                 lines = []
                 for t in state.get("trades", [])[:6]:
                     lines.append(
-                        f"• *{t['pair']}* {t['side']} `{float(t['pnl']):+.2f}` [{t['reason']}] ({fmt_ist(t.get('exitTs'))})"
+                        f"• <b>{html.escape(t['pair'])}</b> {html.escape(t['side'])} "
+                        f"<code>{float(t['pnl']):+.2f}</code> [{html.escape(t['reason'])}] ({html.escape(fmt_ist(t.get('exitTs')))})"
                     )
                 reply = "\n".join(lines) if lines else "No closed trades yet."
 
             elif cmd == "/balance":
                 reply = (
-                    f"*Mode:* {'Paper (`DRY_RUN=true`)' if cfg['DRY_RUN'] else 'Live (`DRY_RUN=false`)'}\n"
-                    f"*Equity:* `{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT`\n"
-                    f"*Leg Y Notional:* `{cfg['NOTIONAL_USDT']} USDT` | *Max Hold:* `{cfg['MAX_HOLD_MINUTES']}m`"
+                    f"<b>Mode:</b> {'Paper (<code>DRY_RUN=true</code>)' if cfg['DRY_RUN'] else 'Live (<code>DRY_RUN=false</code>)'}\n"
+                    f"<b>Equity:</b> <code>{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT</code>\n"
+                    f"<b>Leg Y Notional:</b> <code>{cfg['NOTIONAL_USDT']} USDT</code> | <b>Max Hold:</b> <code>{cfg['MAX_HOLD_MINUTES']}m</code>"
                 )
 
             elif cmd == "/config":
-                rows = ["*Active Runtime Configuration:*"]
+                rows = ["<b>Active Runtime Configuration:</b>"]
                 for key in [
                     "DRY_RUN",
                     "TOP_N_COINS",
@@ -950,8 +973,8 @@ class StatArbBot:
                     "Z_EXIT",
                     "Z_STOP",
                 ]:
-                    tag = " _(edited)_" if cfg[key] != defaults[key] else ""
-                    rows.append(f"• `{key}` = `{cfg[key]}`{tag}")
+                    tag = " <i>(edited)</i>" if cfg[key] != defaults[key] else ""
+                    rows.append(f"• <code>{key}</code> = <code>{cfg[key]}</code>{tag}")
                 reply = "\n".join(rows)
 
             elif cmd == "/resetconfig":
@@ -964,13 +987,13 @@ class StatArbBot:
                 state["paused"] = True
                 self.store.add_event("CONTROL", "Bot paused via Telegram")
                 await self.store.save()
-                reply = "⏸ Bot *paused*. Existing positions remain monitored."
+                reply = "⏸ Bot <b>paused</b>. Existing positions remain monitored."
 
             elif cmd == "/resume":
                 state["paused"] = False
                 self.store.add_event("CONTROL", "Bot resumed via Telegram")
                 await self.store.save()
-                reply = "▶️ Bot *resumed*."
+                reply = "▶️ Bot <b>resumed</b>."
 
             elif cmd == "/setdryrun":
                 v = arg1.lower()
@@ -978,19 +1001,19 @@ class StatArbBot:
                     cfg["DRY_RUN"] = True
                     self.store.add_event("CONFIG", "DRY_RUN set to True via Telegram")
                     await self.store.save()
-                    reply = "✅ `DRY_RUN` set to `True` (Paper Trading)."
+                    reply = "✅ <code>DRY_RUN</code> set to <code>True</code> (Paper Trading)."
                 elif v == "false":
                     if arg2.lower() != "confirm":
-                        reply = "⚠️ Live mode places real Gate.io orders. Send `/setdryrun false confirm` to activate."
+                        reply = "⚠️ Live mode places real Gate.io orders. Send <code>/setdryrun false confirm</code> to activate."
                     elif not GATE_API_KEY or not GATE_API_SECRET:
-                        reply = "❌ Cannot enable live mode: `GATE_API_KEY` or `GATE_API_SECRET` is missing in Voroa."
+                        reply = "❌ Cannot enable live mode: <code>GATE_API_KEY</code> or <code>GATE_API_SECRET</code> is missing in Voroa."
                     else:
                         cfg["DRY_RUN"] = False
                         self.store.add_event("CONFIG", "DRY_RUN set to False (LIVE) via Telegram")
                         await self.store.save()
-                        reply = "🚨 `DRY_RUN` set to `False` (*LIVE TRADING ENABLED*)."
+                        reply = "🚨 <code>DRY_RUN</code> set to <code>False</code> (<b>LIVE TRADING ENABLED</b>)."
                 else:
-                    reply = "Usage: `/setdryrun true` or `/setdryrun false confirm`"
+                    reply = "Usage: <code>/setdryrun true</code> or <code>/setdryrun false confirm</code>"
 
             elif cmd == "/settopn":
                 try:
@@ -1000,9 +1023,9 @@ class StatArbBot:
                     cfg["TOP_N_COINS"] = val
                     self.store.add_event("CONFIG", f"TOP_N_COINS updated to {val}")
                     await self.store.save()
-                    reply = f"✅ `TOP_N_COINS` updated to `{val}`."
+                    reply = f"✅ <code>TOP_N_COINS</code> updated to <code>{val}</code>."
                 except ValueError:
-                    reply = "Usage: `/settopn <10-200>` (e.g. `/settopn 80`)"
+                    reply = "Usage: <code>/settopn &lt;10-200&gt;</code> (e.g. <code>/settopn 80</code>)"
 
             elif cmd == "/setlookback":
                 try:
@@ -1012,9 +1035,9 @@ class StatArbBot:
                     cfg["LOOKBACK"] = val
                     self.store.add_event("CONFIG", f"LOOKBACK updated to {val}")
                     await self.store.save()
-                    reply = f"✅ `LOOKBACK` updated to `{val}` bars."
+                    reply = f"✅ <code>LOOKBACK</code> updated to <code>{val}</code> bars."
                 except ValueError:
-                    reply = "Usage: `/setlookback <30-300>` (e.g. `/setlookback 120`)"
+                    reply = "Usage: <code>/setlookback &lt;30-300&gt;</code> (e.g. <code>/setlookback 120</code>)"
 
             elif cmd == "/setmaxpos":
                 try:
@@ -1024,9 +1047,9 @@ class StatArbBot:
                     cfg["MAX_POSITIONS"] = val
                     self.store.add_event("CONFIG", f"MAX_POSITIONS updated to {val}")
                     await self.store.save()
-                    reply = f"✅ `MAX_POSITIONS` updated to `{val}`."
+                    reply = f"✅ <code>MAX_POSITIONS</code> updated to <code>{val}</code>."
                 except ValueError:
-                    reply = "Usage: `/setmaxpos <1-10>` (e.g. `/setmaxpos 4`)"
+                    reply = "Usage: <code>/setmaxpos &lt;1-10&gt;</code> (e.g. <code>/setmaxpos 4</code>)"
 
             elif cmd == "/setmaxhold":
                 try:
@@ -1036,9 +1059,9 @@ class StatArbBot:
                     cfg["MAX_HOLD_MINUTES"] = val
                     self.store.add_event("CONFIG", f"MAX_HOLD_MINUTES updated to {val}")
                     await self.store.save()
-                    reply = f"✅ `MAX_HOLD_MINUTES` updated to `{val}` min."
+                    reply = f"✅ <code>MAX_HOLD_MINUTES</code> updated to <code>{val}</code> min."
                 except ValueError:
-                    reply = "Usage: `/setmaxhold <15-4320>` (e.g. `/setmaxhold 480`)"
+                    reply = "Usage: <code>/setmaxhold &lt;15-4320&gt;</code> (e.g. <code>/setmaxhold 480</code>)"
 
             elif cmd == "/setnotional":
                 try:
@@ -1048,9 +1071,9 @@ class StatArbBot:
                     cfg["NOTIONAL_USDT"] = round(val, 2)
                     self.store.add_event("CONFIG", f"NOTIONAL_USDT updated to {cfg['NOTIONAL_USDT']}")
                     await self.store.save()
-                    reply = f"✅ `NOTIONAL_USDT` updated to `{cfg['NOTIONAL_USDT']}` USDT."
+                    reply = f"✅ <code>NOTIONAL_USDT</code> updated to <code>{cfg['NOTIONAL_USDT']}</code> USDT."
                 except ValueError:
-                    reply = "Usage: `/setnotional <10-10000>` (e.g. `/setnotional 150`)"
+                    reply = "Usage: <code>/setnotional &lt;10-10000&gt;</code> (e.g. <code>/setnotional 150</code>)"
 
             elif cmd == "/setz":
                 try:
@@ -1058,14 +1081,14 @@ class StatArbBot:
                     if not (0.5 <= val <= 6.0):
                         raise ValueError
                     if not (float(cfg["Z_EXIT"]) < val < float(cfg["Z_STOP"])):
-                        reply = f"❌ Must satisfy `Z_EXIT ({cfg['Z_EXIT']}) < Z_ENTRY < Z_STOP ({cfg['Z_STOP']})`."
+                        reply = f"❌ Must satisfy <code>Z_EXIT ({cfg['Z_EXIT']}) &lt; Z_ENTRY &lt; Z_STOP ({cfg['Z_STOP']})</code>."
                     else:
                         cfg["Z_ENTRY"] = round(val, 4)
                         self.store.add_event("CONFIG", f"Z_ENTRY updated to {cfg['Z_ENTRY']}")
                         await self.store.save()
-                        reply = f"✅ `Z_ENTRY` updated to `{cfg['Z_ENTRY']}`."
+                        reply = f"✅ <code>Z_ENTRY</code> updated to <code>{cfg['Z_ENTRY']}</code>."
                 except ValueError:
-                    reply = "Usage: `/setz <0.5-6.0>` (e.g. `/setz 2.2`)"
+                    reply = "Usage: <code>/setz &lt;0.5-6.0&gt;</code> (e.g. <code>/setz 2.2</code>)"
 
             elif cmd == "/setzexit":
                 try:
@@ -1073,14 +1096,14 @@ class StatArbBot:
                     if not (0.0 <= val <= 3.0):
                         raise ValueError
                     if val >= float(cfg["Z_ENTRY"]):
-                        reply = f"❌ Must be strictly less than `Z_ENTRY ({cfg['Z_ENTRY']})`."
+                        reply = f"❌ Must be strictly less than <code>Z_ENTRY ({cfg['Z_ENTRY']})</code>."
                     else:
                         cfg["Z_EXIT"] = round(val, 4)
                         self.store.add_event("CONFIG", f"Z_EXIT updated to {cfg['Z_EXIT']}")
                         await self.store.save()
-                        reply = f"✅ `Z_EXIT` updated to `{cfg['Z_EXIT']}`."
+                        reply = f"✅ <code>Z_EXIT</code> updated to <code>{cfg['Z_EXIT']}</code>."
                 except ValueError:
-                    reply = "Usage: `/setzexit <0.0-3.0>` (e.g. `/setzexit 0.4`)"
+                    reply = "Usage: <code>/setzexit &lt;0.0-3.0&gt;</code> (e.g. <code>/setzexit 0.4</code>)"
 
             elif cmd == "/setzstop":
                 try:
@@ -1088,17 +1111,17 @@ class StatArbBot:
                     if not (1.5 <= val <= 10.0):
                         raise ValueError
                     if val <= float(cfg["Z_ENTRY"]):
-                        reply = f"❌ Must be strictly greater than `Z_ENTRY ({cfg['Z_ENTRY']})`."
+                        reply = f"❌ Must be strictly greater than <code>Z_ENTRY ({cfg['Z_ENTRY']})</code>."
                     else:
                         cfg["Z_STOP"] = round(val, 4)
                         self.store.add_event("CONFIG", f"Z_STOP updated to {cfg['Z_STOP']}")
                         await self.store.save()
-                        reply = f"✅ `Z_STOP` updated to `{cfg['Z_STOP']}`."
+                        reply = f"✅ <code>Z_STOP</code> updated to <code>{cfg['Z_STOP']}</code>."
                 except ValueError:
-                    reply = "Usage: `/setzstop <1.5-10.0>` (e.g. `/setzstop 4.0`)"
+                    reply = "Usage: <code>/setzstop &lt;1.5-10.0&gt;</code> (e.g. <code>/setzstop 4.0</code>)"
 
             else:
-                reply = "Unknown command. Send `/help` to view all commands."
+                reply = "Unknown command. Send <code>/help</code> to view all commands."
 
         await self.send_telegram(reply, chat_id)
 
