@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import ccxt.async_support as ccxt
 from aiohttp import web, ClientSession, ClientTimeout
@@ -13,6 +13,8 @@ from strategy import StatArbEngine
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 log = logging.getLogger("GateArb")
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 GATE_API_KEY = os.getenv("GATE_API_KEY", "")
 GATE_API_SECRET = os.getenv("GATE_API_SECRET", "")
@@ -62,8 +64,12 @@ state = {
 candle_cache: dict[str, pd.DataFrame] = {}
 
 
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
 def add_event(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    ts = now_ist().strftime("%H:%M:%S IST")
     state["events"].insert(0, f"[{ts}] {msg}")
     state["events"] = state["events"][:25]
 
@@ -224,7 +230,7 @@ async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict |
         "entry_z": round(m["z_score"], 2),
         "current_z": round(m["z_score"], 2),
         "unrealized_pnl": 0.0,
-        "entry_time": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
+        "entry_time": now_ist().strftime("%d-%m %H:%M IST"),
     }
     state["positions"].append(pos_rec)
     state["active_pair_y"] = pair_y
@@ -259,7 +265,7 @@ async def close_single_position(ex, pos: dict, price_y: float | None = None, pri
         state["losses"] += 1
 
     trade_rec = {
-        "time": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
+        "time": now_ist().strftime("%d-%m %H:%M"),
         "pair": pos["label"],
         "side": pos["side"],
         "entry_z": pos["entry_z"],
@@ -290,7 +296,7 @@ DASHBOARD_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Gate.io Top-100 Stat-Arb Simulator</title>
+  <title>Gate.io Top-100 Stat-Arb Simulator (IST)</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
     .wrap { max-width: 1080px; margin: 0 auto; }
@@ -300,13 +306,14 @@ DASHBOARD_HTML = """<!doctype html>
     .dry { background: #1e3a8a; color: #93c5fd; }
     .ready-pill { background: #065f46; color: #6ee7b7; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 700; }
     .watch-pill { background: #334155; color: #cbd5e1; padding: 2px 7px; border-radius: 6px; font-size: 11px; }
-    .controls { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+    .controls { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; align-items: center; }
     button { border: 1px solid #334155; background: #1e293b; color: #f8fafc; padding: 9px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }
     button:hover:not(:disabled) { background: #334155; }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
     .btn-pause { border-color: #d97706; color: #fcd34d; }
     .btn-resume { border-color: #059669; color: #6ee7b7; }
     .btn-close { border-color: #dc2626; color: #fca5a5; }
+    .ist-clock { margin-left: auto; font-family: monospace; font-size: 13px; color: #94a3b8; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 12px; margin-bottom: 18px; }
     .card { background: #1e293b; padding: 14px; border-radius: 10px; border: 1px solid #334155; }
     .label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
@@ -337,6 +344,7 @@ DASHBOARD_HTML = """<!doctype html>
     <button id="btnPause" class="btn-pause" onclick="sendAction('pause')">Pause</button>
     <button id="btnResume" class="btn-resume" onclick="sendAction('resume')">Resume</button>
     <button id="btnClose" class="btn-close" onclick="sendAction('closeall')">Close All</button>
+    <span id="istClock" class="ist-clock">IST: --:--:--</span>
   </div>
   <div class="grid">
     <div class="card"><div class="label">Sim Equity (USDT)</div><div class="val" id="eq">1000.00</div></div>
@@ -350,7 +358,7 @@ DASHBOARD_HTML = """<!doctype html>
 
   <h4 style="margin:0 0 8px 0;color:#94a3b8">Open Positions</h4>
   <table>
-    <thead><tr><th>Pair</th><th>Side</th><th>Entry Z</th><th>Now Z</th><th>Unrealized ($)</th><th>Opened</th></tr></thead>
+    <thead><tr><th>Pair</th><th>Side</th><th>Entry Z</th><th>Now Z</th><th>Unrealized ($)</th><th>Opened (IST)</th></tr></thead>
     <tbody id="openPos"><tr><td colspan="6">No open positions</td></tr></tbody>
   </table>
 
@@ -363,21 +371,31 @@ DASHBOARD_HTML = """<!doctype html>
       </table>
     </div>
     <div>
-      <h4 style="margin:0 0 8px 0;color:#94a3b8">Simulated Trade History</h4>
+      <h4 style="margin:0 0 8px 0;color:#94a3b8">Simulated Trade History (IST)</h4>
       <table>
-        <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Z In/Out</th><th>PnL ($)</th></tr></thead>
+        <thead><tr><th>Time (IST)</th><th>Pair</th><th>Side</th><th>Z In/Out</th><th>PnL ($)</th></tr></thead>
         <tbody id="trades"><tr><td colspan="5">No trades yet</td></tr></tbody>
       </table>
     </div>
   </div>
 
-  <h4 style="margin:0 0 8px 0;color:#94a3b8">Recent Activity</h4>
+  <h4 style="margin:0 0 8px 0;color:#94a3b8">Recent Activity (IST)</h4>
   <ul id="events"><li>Starting fast scan...</li></ul>
 </div>
 <script>
 function fmtPnl(v) {
   const cls = v > 0 ? 'pos-green' : (v < 0 ? 'neg-red' : '');
   return `<span class="${cls}">${v >= 0 ? '+' : ''}${v.toFixed(2)}</span>`;
+}
+function updateIstClock() {
+  const istStr = new Date().toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  document.getElementById('istClock').textContent = `IST: ${istStr}`;
 }
 function drawChart(pts, entry) {
   const svg = document.getElementById('chart');
@@ -445,13 +463,16 @@ async function sendAction(action) {
   }
 }
 async function refresh() {
+  updateIstClock();
   try {
     const r = await fetch('/api/state');
     applyState(await r.json());
   } catch (e) {}
 }
+updateIstClock();
+setInterval(updateIstClock, 1000);
 refresh();
-setInterval(refresh, 4000);
+setInterval(refresh, 3000);
 </script>
 </body>
 </html>"""
@@ -591,7 +612,7 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state["trades"]:
         await update.message.reply_text("No closed simulated trades yet.")
         return
-    lines = ["Recent Simulated Trades:"]
+    lines = ["Recent Simulated Trades (IST):"]
     for t in state["trades"][:8]:
         lines.append(f"• {t['time']} {t['pair']} {t['side']} ({t['entry_z']}→{t['exit_z']}): {t['pnl']:+.2f} USDT")
     await update.message.reply_text("\n".join(lines))
@@ -670,7 +691,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status - Open positions, Z-score, unrealized PnL\n"
         "/pnl - Simulated equity, realized PnL, win/loss stats\n"
         "/top - Top entry-ready & cointegrated pairs\n"
-        "/trades - Recent simulated trade history\n"
+        "/trades - Recent simulated trade history (IST)\n"
         "/balance - Gate.io live USDT futures balance\n"
         "/setz <val> - Set Z-score entry threshold\n"
         "/pause | /resume | /closeall"
@@ -717,7 +738,7 @@ async def trader_loop(tg_app: Application):
                     state["last_scan_sec"] = elapsed
                     state["top_pairs"] = ranked_pairs[:15]
                     state["ready_count"] = sum(1 for r in ranked_pairs if r.get("entry_ready"))
-                    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    state["updated_at"] = now_ist().isoformat()
                     state["scan_status"] = f"{'ACTIVE' if state['running'] else 'PAUSED'} • Scanned in {elapsed}s"
 
                     if cycle == 1:
@@ -740,7 +761,7 @@ async def trader_loop(tg_app: Application):
                                     ex, pos, m["price_y"], m["price_x"], m["z_score"], reason=reason
                                 )
                                 msg = (
-                                    f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']})\n"
+                                    f"[SIM CLOSED - {reason}] {tr['pair']} ({tr['side']}) • {tr['time']} IST\n"
                                     f"Z: {tr['entry_z']} → {tr['exit_z']} | Net PnL: {tr['pnl']:+.2f} USDT\n"
                                     f"Sim Equity: {state['sim_equity']:.2f} USDT"
                                 )
@@ -781,7 +802,7 @@ async def trader_loop(tg_app: Application):
                                 state["active_pair_y"], state["active_pair_x"] = cand["pair_y"], cand["pair_x"]
                                 state["metrics"] = cand
                                 msg = (
-                                    f"[AUTO ENTRY {len(state['positions'])}/{MAX_POSITIONS}] {sig} on {pos_rec['label']}\n"
+                                    f"[AUTO ENTRY {len(state['positions'])}/{MAX_POSITIONS}] {sig} on {pos_rec['label']} • {pos_rec['entry_time']}\n"
                                     f"Z: {cand['z_score']:+.2f} | Beta: {cand['beta']:.3f} | ADF: {cand['adf_stat']:.2f} | HL: {cand['half_life']:.0f}b\n"
                                     f"{pos_rec['side_y'].upper()} {pos_rec['qty_y']} {cand['pair_y']} @ {cand['price_y']}\n"
                                     f"{pos_rec['side_x'].upper()} {pos_rec['qty_x']} {cand['pair_x']} @ {cand['price_x']}"
