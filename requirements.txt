@@ -1,7 +1,0 @@
-ccxt
-python-telegram-bot
-aiohttp
-pandas
-numpy
-python-dotenv
-redis
