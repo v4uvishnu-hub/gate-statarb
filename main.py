@@ -1377,6 +1377,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 let latestState = null;
 let countdownSec = 3;
+let isFetchingState = false;
 
 function fmtIST(ts) {
   if (!ts) return "-";
@@ -1526,14 +1527,29 @@ function renderState(s) {
 }
 
 async function fetchState() {
+  if (isFetchingState) {
+    countdownSec = 3;
+    return;
+  }
+  isFetchingState = true;
+  countdownSec = 3;
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), 2500);
   try {
-    const res = await fetch("/api/state");
+    const res = await fetch("/api/state", {
+      cache: "no-store",
+      signal: controller.signal
+    });
     if (res.ok) {
       const data = await res.json();
       renderState(data);
     }
-  } catch (e) {}
-  countdownSec = 3;
+  } catch (e) {} finally {
+    clearTimeout(timerId);
+    isFetchingState = false;
+    countdownSec = 3;
+    tickClockAndBars();
+  }
 }
 
 async function sendControl(payload) {
@@ -1556,8 +1572,10 @@ function closeAll() {
 }
 
 setInterval(() => {
-  countdownSec -= 1;
-  if (countdownSec <= 0) {
+  if (!isFetchingState) {
+    countdownSec = Math.max(0, countdownSec - 1);
+  }
+  if (countdownSec === 0 && !isFetchingState) {
     fetchState();
   } else {
     tickClockAndBars();
