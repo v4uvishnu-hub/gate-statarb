@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
@@ -30,6 +31,11 @@ SIM_START_EQUITY = float(os.getenv("SIM_START_EQUITY", "1000"))
 TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0005"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+# State persistence options
+PERSIST_STATE = os.getenv("PERSIST_STATE", "true").lower() == "true"
+STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
 
 GATE_FUTURES_BASE = "https://api.gateio.ws/api/v4/futures/usdt"
 
@@ -68,10 +74,76 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def add_event(msg: str):
+def save_state():
+    if not PERSIST_STATE:
+        return
+    try:
+        parent = os.path.dirname(STATE_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "running": state["running"],
+            "z_entry": engine.z_entry,
+            "active_pair_y": state["active_pair_y"],
+            "active_pair_x": state["active_pair_x"],
+            "positions": state["positions"],
+            "sim_equity": state["sim_equity"],
+            "realized_pnl": state["realized_pnl"],
+            "wins": state["wins"],
+            "losses": state["losses"],
+            "trades": state["trades"],
+            "events": state["events"],
+        }
+        tmp_path = f"{STATE_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception as e:
+        log.error(f"Failed to save state to {STATE_FILE}: {e}")
+
+
+def load_state():
+    if not PERSIST_STATE or RESET_STATE:
+        if RESET_STATE and os.path.exists(STATE_FILE):
+            try:
+                os.remove(STATE_FILE)
+                log.info(f"RESET_STATE=true: removed {STATE_FILE}")
+            except Exception as e:
+                log.warning(f"Could not remove {STATE_FILE}: {e}")
+        return
+    if not os.path.exists(STATE_FILE):
+        log.info(f"No saved state at {STATE_FILE}; starting fresh.")
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        state["running"] = bool(saved.get("running", True))
+        if "z_entry" in saved:
+            engine.z_entry = float(saved["z_entry"])
+        state["active_pair_y"] = saved.get("active_pair_y", state["active_pair_y"])
+        state["active_pair_x"] = saved.get("active_pair_x", state["active_pair_x"])
+        state["positions"] = list(saved.get("positions", []))
+        state["sim_equity"] = float(saved.get("sim_equity", SIM_START_EQUITY))
+        state["realized_pnl"] = float(saved.get("realized_pnl", 0.0))
+        state["wins"] = int(saved.get("wins", 0))
+        state["losses"] = int(saved.get("losses", 0))
+        state["trades"] = list(saved.get("trades", []))
+        state["events"] = list(saved.get("events", []))
+        state["unrealized_pnl"] = sum(float(p.get("unrealized_pnl", 0.0)) for p in state["positions"])
+        log.info(
+            f"Restored state from {STATE_FILE}: {len(state['positions'])} open pos, "
+            f"{len(state['trades'])} trades, equity={state['sim_equity']:.2f}"
+        )
+    except Exception as e:
+        log.error(f"Failed to load state from {STATE_FILE}: {e}")
+
+
+def add_event(msg: str, persist: bool = True):
     ts = now_ist().strftime("%H:%M:%S IST")
     state["events"].insert(0, f"[{ts}] {msg}")
     state["events"] = state["events"][:25]
+    if persist:
+        save_state()
 
 
 def make_exchange():
@@ -235,6 +307,7 @@ async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict |
     state["positions"].append(pos_rec)
     state["active_pair_y"] = pair_y
     state["active_pair_x"] = pair_x
+    save_state()
     return pos_rec
 
 
@@ -277,6 +350,7 @@ async def close_single_position(ex, pos: dict, price_y: float | None = None, pri
     state["trades"] = state["trades"][:40]
 
     state["positions"] = [p for p in state["positions"] if p is not pos]
+    save_state()
     return trade_rec
 
 
@@ -286,6 +360,7 @@ async def close_all_positions(ex, reason: str = "MANUAL") -> list[dict]:
         tr = await close_single_position(ex, pos, reason=reason)
         closed.append(tr)
     state["unrealized_pnl"] = 0.0
+    save_state()
     return closed
 
 
@@ -480,6 +555,8 @@ setInterval(refresh, REFRESH_INTERVAL_SEC * 1000);
 def snapshot_state() -> dict:
     return {
         "running": state["running"],
+        "persist_state": PERSIST_STATE,
+        "state_file": STATE_FILE,
         "scan_status": state["scan_status"],
         "last_scan_sec": state["last_scan_sec"],
         "dry_run": DRY_RUN,
@@ -568,6 +645,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z_txt = f"{m['z_score']:.2f} (±{engine.z_entry:.2f}) | ADF: {m['adf_stat']:.2f}" if m else state["scan_status"]
     await update.message.reply_text(
         f"Mode: {'SIMULATOR' if DRY_RUN else 'LIVE'} | {'ON' if state['running'] else 'PAUSED'}\n"
+        f"Persist: {'ON' if PERSIST_STATE else 'OFF'} ({STATE_FILE})\n"
         f"Scan: {state['universe_count']} coins in {state['last_scan_sec']}s ({state['ready_count']} entry-ready)\n"
         f"Open Pairs: {len(state['positions'])}/{MAX_POSITIONS} | Total uPnL: {state['unrealized_pnl']:+.2f} USDT\n"
         f"Focus ({state['active_pair_y'].split('/')[0]}/{state['active_pair_x'].split('/')[0]}): {z_txt}\n"
@@ -742,7 +820,7 @@ async def trader_loop(tg_app: Application):
 
                     if cycle == 1:
                         add_event(
-                            f"Initial scan finished in {elapsed}s ({len(ohlcv_map)} coins, {state['ready_count']} entry-ready)"
+                            f"Scan started in {elapsed}s ({len(ohlcv_map)} coins, {len(state['positions'])} open pos restored)"
                         )
 
                     for pos in list(state["positions"]):
@@ -812,7 +890,7 @@ async def trader_loop(tg_app: Application):
                 except Exception as e:
                     log.error(f"Loop error: {e}", exc_info=True)
                     state["scan_status"] = f"Error: {e}"
-                    add_event(f"Loop error: {e}")
+                    add_event(f"Loop error: {e}", persist=False)
 
                 await asyncio.sleep(POLL_SECONDS)
     finally:
@@ -825,6 +903,7 @@ async def post_init(tg_app: Application):
 
 
 def main():
+    load_state()
     tg_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("pnl", cmd_pnl))
