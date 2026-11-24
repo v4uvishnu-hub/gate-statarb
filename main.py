@@ -30,6 +30,8 @@ HELP_TEXT_HTML = (
     "<b>Gate.io Top-100 Stat-Arb Admin Commands</b>\n"
     "Tap any command below:\n\n"
     "/status - Bot state, mode, alerts, slots &amp; last IST tick\n"
+    "/pin - Pin &amp; auto-refresh live status card in chat\n"
+    "/unpin - Unpin live status card\n"
     "/pnl - Realized, unrealized PnL, equity &amp; W/L record\n"
     "/top - Top ranked cointegrated pairs &amp; live Z-scores\n"
     "/trades - Recent closed spread trades\n"
@@ -92,6 +94,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
 
 CANDLE_INTERVAL = os.getenv("CANDLE_INTERVAL", "5m")
 SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 45))
+TG_PIN_REFRESH_SEC = max(20, env_int("TG_PIN_REFRESH_SEC", 60))
 INITIAL_EQUITY = max(50.0, env_float("INITIAL_EQUITY", 1000.0))
 TAKER_FEE = max(0.0, env_float("TAKER_FEE", 0.0005))
 FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 15)))
@@ -135,6 +138,8 @@ class StateStore:
             "positions": [],
             "ranked_pairs": [],
             "trades": [],
+            "pinned_chat_id": None,
+            "pinned_message_id": None,
             "events": [
                 {
                     "ts": now_ms(),
@@ -453,6 +458,7 @@ class StatArbBot:
         self.gate = gate
         self.session = session
         self.tg_offset = 0
+        self._last_pin_text: Optional[str] = None
 
     async def send_telegram(
         self,
@@ -460,17 +466,17 @@ class StatArbBot:
         chat_id: Optional[str] = None,
         parse_mode: Optional[str] = "HTML",
         allow_when_muted: bool = True,
-    ) -> None:
+    ) -> Optional[int]:
         if not allow_when_muted:
             async with self.store.lock:
                 muted = not bool(self.store.state.get("config", {}).get("TRADE_ALERTS", True))
             if muted:
-                return
+                return None
 
         target = chat_id or TELEGRAM_ADMIN_ID
         if not TELEGRAM_BOT_TOKEN or not target:
             log.warning("Telegram alert skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_ADMIN_ID")
-            return
+            return None
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload: Dict[str, Any] = {"chat_id": target, "text": text}
         if parse_mode:
@@ -485,14 +491,165 @@ class StatArbBot:
                 if resp.status != 200:
                     log.warning("Telegram sendMessage failed (%s): %s", resp.status, body[:250])
                     if parse_mode is not None:
-                        await self.send_telegram(
+                        return await self.send_telegram(
                             text,
                             chat_id=target,
                             parse_mode=None,
                             allow_when_muted=allow_when_muted,
                         )
+                    return None
+                data = json.loads(body)
+                return int((data.get("result") or {}).get("message_id") or 0) or None
         except Exception as exc:
             log.warning("Telegram send error: %s", exc)
+            return None
+
+    async def _build_pinned_card_html(self) -> str:
+        async with self.store.lock:
+            state = self.store.state
+            cfg = state.get("config", {})
+            positions = state.get("positions", [])
+            ranked = state.get("ranked_pairs", [])
+            u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in positions)
+            mode = "PAPER" if cfg.get("DRY_RUN", True) else "LIVE"
+            run_state = "⏸ PAUSED" if state.get("paused") else "▶️ RUNNING"
+            alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
+            equity = float(state.get("sim_equity", INITIAL_EQUITY))
+            r_pnl = float(state.get("realized_pnl", 0.0))
+            wins = int(state.get("wins", 0))
+            losses = int(state.get("losses", 0))
+            max_pos = int(cfg.get("MAX_POSITIONS", 3))
+            last_tick = fmt_ist(state.get("last_tick_ts"))
+            top_pair = ranked[0] if ranked else None
+
+        lines = [
+            f"📌 <b>STATARB LIVE CARD</b> ({run_state} | <b>{mode}</b>)",
+            f"<b>Equity:</b> <code>{equity:.2f} USDT</code> | <b>Alerts:</b> <code>{alerts_state}</code>",
+            f"<b>Realized:</b> <code>{r_pnl:+.2f}</code> | <b>Unrealized:</b> <code>{u_pnl:+.2f} USDT</code>",
+            f"<b>Record:</b> <code>{wins}W / {losses}L</code> | <b>Slots:</b> <code>{len(positions)}/{max_pos}</code>",
+        ]
+
+        if positions:
+            lines.append("<b>Open Spreads:</b>")
+            for p in positions[:3]:
+                lines.append(
+                    f"• <code>{html.escape(str(p.get('pair')))}</code> {html.escape(str(p.get('side')))} "
+                    f"Z=<code>{float(p.get('zNow') or 0.0):.2f}</code> "
+                    f"PnL=<code>{float(p.get('unrealizedPnl') or 0.0):+.2f}</code>"
+                )
+        elif top_pair:
+            lines.append(
+                f"<b>Top Pair:</b> <code>{html.escape(str(top_pair.get('pair')))}</code> "
+                f"[{html.escape(str(top_pair.get('status')))}] Z=<code>{float(top_pair.get('zNow') or 0.0):.2f}</code>"
+            )
+
+        lines.append(f"<b>Last Tick:</b> {html.escape(last_tick)}")
+        lines.append(f"<b>Updated:</b> {html.escape(fmt_ist(now_ms()))} (every {TG_PIN_REFRESH_SEC}s)")
+        return "\n".join(lines)
+
+    async def pin_chat_message(self, chat_id: str, message_id: int) -> None:
+        if not TELEGRAM_BOT_TOKEN:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
+        try:
+            async with self.session.post(
+                url,
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "disable_notification": True,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.warning("pinChatMessage failed (%s): %s", resp.status, body[:200])
+        except Exception as exc:
+            log.warning("pinChatMessage error: %s", exc)
+
+    async def unpin_chat_message(self, chat_id: Optional[str] = None, message_id: Optional[int] = None) -> None:
+        if not TELEGRAM_BOT_TOKEN:
+            return
+        target_chat = chat_id or TELEGRAM_ADMIN_ID
+        if not target_chat:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/unpinChatMessage"
+        payload: Dict[str, Any] = {"chat_id": target_chat}
+        if message_id:
+            payload["message_id"] = message_id
+        try:
+            async with self.session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                await resp.read()
+        except Exception as exc:
+            log.warning("unpinChatMessage error: %s", exc)
+
+    async def sync_pinned_dashboard(self, force_new: bool = False, chat_override: Optional[str] = None) -> str:
+        if not TELEGRAM_BOT_TOKEN:
+            return "TELEGRAM_BOT_TOKEN is not configured."
+
+        card_text = await self._build_pinned_card_html()
+        async with self.store.lock:
+            target_chat = chat_override or self.store.state.get("pinned_chat_id") or TELEGRAM_ADMIN_ID
+            msg_id = self.store.state.get("pinned_message_id")
+
+        if not target_chat:
+            return "TELEGRAM_ADMIN_ID is not configured."
+
+        if not force_new and msg_id:
+            if card_text == self._last_pin_text:
+                return f"Pinned card is already up to date (message #{msg_id})."
+            edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+            try:
+                async with self.session.post(
+                    edit_url,
+                    json={
+                        "chat_id": target_chat,
+                        "message_id": msg_id,
+                        "text": card_text,
+                        "parse_mode": "HTML",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        self._last_pin_text = card_text
+                        return f"Updated pinned dashboard card (#{msg_id})."
+                    if "message is not modified" in body.lower():
+                        self._last_pin_text = card_text
+                        return f"Pinned card is already current (#{msg_id})."
+                    log.warning("editMessageText failed (%s): %s; creating fresh pinned card", resp.status, body[:200])
+            except Exception as exc:
+                log.warning("editMessageText error: %s; creating fresh pinned card", exc)
+
+        new_msg_id = await self.send_telegram(card_text, chat_id=target_chat, parse_mode="HTML")
+        if not new_msg_id:
+            return "Failed to send pinned dashboard card."
+
+        await self.pin_chat_message(str(target_chat), int(new_msg_id))
+        self._last_pin_text = card_text
+        async with self.store.lock:
+            self.store.state["pinned_chat_id"] = str(target_chat)
+            self.store.state["pinned_message_id"] = int(new_msg_id)
+            self.store.add_event("TELEGRAM", f"Pinned live status card (#{new_msg_id})")
+            await self.store.save()
+        return f"Pinned live status card (#{new_msg_id}) — auto-refreshes every {TG_PIN_REFRESH_SEC}s."
+
+    async def pinned_dashboard_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(TG_PIN_REFRESH_SEC)
+                async with self.store.lock:
+                    has_pin = bool(self.store.state.get("pinned_message_id"))
+                if has_pin:
+                    await self.sync_pinned_dashboard(force_new=False)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.warning("Pinned dashboard refresh error: %s", exc)
 
     async def refresh_contracts_meta(self) -> None:
         if self.store.contracts_meta and (time.time() - self.store.contracts_meta_ts) < 6 * 3600:
@@ -915,6 +1072,22 @@ class StatArbBot:
 
         if cmd in ("/help", "/start"):
             await self.send_telegram(HELP_TEXT_HTML, chat_id)
+            return
+
+        if cmd == "/pin":
+            status_msg = await self.sync_pinned_dashboard(force_new=True, chat_override=chat_id)
+            await self.send_telegram(f"📌 {html.escape(status_msg)}", chat_id)
+            return
+
+        if cmd == "/unpin":
+            async with self.store.lock:
+                p_chat = self.store.state.get("pinned_chat_id") or chat_id
+                p_msg = self.store.state.get("pinned_message_id")
+                self.store.state["pinned_message_id"] = None
+                self.store.add_event("TELEGRAM", "Unpinned live status card")
+                await self.store.save()
+            await self.unpin_chat_message(str(p_chat), int(p_msg) if p_msg else None)
+            await self.send_telegram("📌 Unpinned live status card.", chat_id)
             return
 
         if cmd == "/testalert":
@@ -1637,12 +1810,14 @@ async def main() -> None:
 
     scanner_task = asyncio.create_task(bot.scanner_loop())
     tg_task = asyncio.create_task(bot.telegram_polling_loop())
+    pin_task = asyncio.create_task(bot.pinned_dashboard_loop())
 
     try:
-        await asyncio.gather(scanner_task, tg_task)
+        await asyncio.gather(scanner_task, tg_task, pin_task)
     finally:
         scanner_task.cancel()
         tg_task.cancel()
+        pin_task.cancel()
         await runner.cleanup()
         await store.close()
         await session.close()
