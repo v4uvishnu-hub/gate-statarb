@@ -43,6 +43,8 @@ RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REDIS_STATE_KEY = os.getenv("REDIS_STATE_KEY", "gate_arb:state:v1").strip()
 _redis_client: aioredis.Redis | None = None
+_trader_task: asyncio.Task | None = None
+_active_exchange = None
 
 GATE_FUTURES_BASE = "https://api.gateio.ws/api/v4/futures/usdt"
 
@@ -87,12 +89,17 @@ def redis_enabled() -> bool:
     return bool(REDIS_URL)
 
 
-def get_redis() -> aioredis.Redis | None:
+async def get_redis() -> aioredis.Redis | None:
     global _redis_client
     if not REDIS_URL:
         return None
     if _redis_client is None:
-        _redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        _redis_client = aioredis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
     return _redis_client
 
 
@@ -174,27 +181,40 @@ def load_local_state() -> bool:
 
 
 async def save_redis_state(payload: dict):
-    client = get_redis()
+    global _redis_client
+    client = await get_redis()
     if not client:
         return
     try:
+        await client.ping()
         await client.set(REDIS_STATE_KEY, json.dumps(payload))
-        log.info(f"Saved state to Redis key '{REDIS_STATE_KEY}'")
+        log.info(
+            f"Saved state to Redis key '{REDIS_STATE_KEY}' "
+            f"(pos={len(payload.get('positions', []))}, trades={len(payload.get('trades', []))}, eq={payload.get('sim_equity')})"
+        )
     except Exception as e:
-        log.error(f"Redis save failed: {e}")
+        log.error(f"Redis save failed for key '{REDIS_STATE_KEY}': {repr(e)}")
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        _redis_client = None
 
 
 async def load_redis_state() -> bool:
-    client = get_redis()
+    global _redis_client
+    client = await get_redis()
     if not client:
         return False
     try:
+        await client.ping()
         if RESET_STATE:
             await client.delete(REDIS_STATE_KEY)
             log.info(f"RESET_STATE=true: deleted Redis key '{REDIS_STATE_KEY}'")
             return False
         raw = await client.get(REDIS_STATE_KEY)
         if not raw:
+            log.info(f"Redis key '{REDIS_STATE_KEY}' is empty; nothing to restore yet.")
             return False
         saved = json.loads(raw)
         if isinstance(saved, dict) and ("positions" in saved or "trades" in saved or "sim_equity" in saved):
@@ -202,7 +222,12 @@ async def load_redis_state() -> bool:
             save_local_state(saved)
             return True
     except Exception as e:
-        log.error(f"Redis load failed: {e}")
+        log.error(f"Redis load failed for key '{REDIS_STATE_KEY}': {repr(e)}")
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        _redis_client = None
     return False
 
 
@@ -1066,7 +1091,9 @@ async def tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- Fast Top-100 Auto-Selection Trading Loop ----------------
 
 async def trader_loop(tg_app: Application):
+    global _active_exchange
     ex = make_exchange()
+    _active_exchange = ex
     await ex.load_markets()
     timeout = ClientTimeout(total=12)
     top_symbols: list[str] = []
@@ -1107,9 +1134,9 @@ async def trader_loop(tg_app: Application):
                             m = engine.compute_metrics(ohlcv_map[py], ohlcv_map[px])
                             cy = float(ohlcv_map[py]["close"].iloc[-1])
                             cx = float(ohlcv_map[px]["close"].iloc[-1])
+                            pos["current_z"] = round(m["z_score"], 2)
                             pos["current_y"] = cy
                             pos["current_x"] = cx
-                            pos["current_z"] = round(m["z_score"], 2)
                             pos["beta"] = round(m["beta"], 3)
                             pos["adf_stat"] = round(m["adf_stat"], 2)
                             pos["half_life"] = round(m["half_life"], 1)
@@ -1182,26 +1209,67 @@ async def trader_loop(tg_app: Application):
                                 add_event(f"AUTO OPENED {sig} {pos_rec['label']} @ Z={cand['z_score']:+.2f} Edge={cand['edge_pct']:+.2f}%")
                                 await tg_app.bot.send_message(ADMIN_ID, msg)
 
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     log.error(f"Loop error: {e}", exc_info=True)
                     state["scan_status"] = f"Error: {e}"
                     add_event(f"Loop error: {e}", persist=False)
 
                 await asyncio.sleep(POLL_SECONDS)
+    except asyncio.CancelledError:
+        log.info("trader_loop cancelled cleanly.")
     finally:
-        await ex.close()
+        try:
+            await ex.close()
+        except Exception:
+            pass
+        if _active_exchange is ex:
+            _active_exchange = None
 
 
 async def post_init(tg_app: Application):
+    global _trader_task
     loaded = await load_redis_state()
     if not loaded:
         load_local_state()
     await start_web()
-    asyncio.create_task(trader_loop(tg_app))
+    _trader_task = asyncio.create_task(trader_loop(tg_app))
+
+
+async def post_stop(tg_app: Application):
+    global _trader_task, _active_exchange, _redis_client
+    if _trader_task and not _trader_task.done():
+        _trader_task.cancel()
+        try:
+            await _trader_task
+        except asyncio.CancelledError:
+            pass
+    _trader_task = None
+
+    if _active_exchange is not None:
+        try:
+            await _active_exchange.close()
+        except Exception:
+            pass
+        _active_exchange = None
+
+    if _redis_client is not None:
+        try:
+            await _redis_client.aclose()
+        except Exception:
+            pass
+        _redis_client = None
 
 
 def main():
-    tg_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    tg_app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_stop(post_stop)
+        .build()
+    )
     tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("pnl", cmd_pnl))
     tg_app.add_handler(CommandHandler("top", cmd_top))
