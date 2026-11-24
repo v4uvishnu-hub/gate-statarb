@@ -75,6 +75,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth(update):
+        return
+    ex = make_exchange()
+    try:
+        bal = await ex.fetch_balance()
+        usdt = bal.get("USDT", {})
+        free_amt = usdt.get("free") or 0.0
+        used_amt = usdt.get("used") or 0.0
+        total_amt = usdt.get("total") or 0.0
+        await update.message.reply_text(
+            f"Gate.io USDT Futures Balance\n"
+            f"Free: {free_amt:.2f} USDT\n"
+            f"Used: {used_amt:.2f} USDT\n"
+            f"Total: {total_amt:.2f} USDT"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Balance check failed: {e}")
+    finally:
+        await ex.close()
+
+
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
@@ -153,6 +175,7 @@ async def post_init(tg_app: Application):
 def main():
     tg_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("balance", cmd_balance))
     tg_app.add_handler(CommandHandler("pause", cmd_pause))
     tg_app.add_handler(CommandHandler("resume", cmd_resume))
     tg_app.add_handler(CommandHandler("closeall", cmd_closeall))
