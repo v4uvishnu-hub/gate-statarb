@@ -26,85 +26,6 @@ GATE_BASE = "https://api.gateio.ws/api/v4"
 STATE_FILE = "bot_state.json"
 REDIS_STATE_KEY = "gate_statarb:state_v1"
 
-HELP_TEXT_HTML = (
-    "<pre>"
-    "🤖 STATARB BOT (ETH/BTC, SOL/BNB, XRP/AVAX)\n\n"
-    "PAIRS\n"
-    "/pairs - Show each pair, ON/OFF and open positions\n"
-    "/pair - Switch one pair on or off (e.g. /pair SOL/BNB on)\n"
-    "/autopair - Scan all pairs every 15 min, trade the best\n"
-    "/why - Why no trade is opening right now (per pair)\n"
-    "/dashboard - Live self-updating position dashboard\n"
-    "/lastscan - Results of the latest automatic scan\n"
-    "/universe - Top-100 Gate.io coins scanned automatically\n"
-    "/coins - Coins scanned and how each did\n"
-    "/setmaxpos - How many pairs may hold a trade at once\n\n"
-    "STATUS &amp; MARKET\n"
-    "/start - Start bot replies\n"
-    "/help - Show commands\n"
-    "/status - Bot status\n"
-    "/market - Latest market analysis for a pair\n"
-    "/config - View all current settings\n"
-    "/positions - Open position PnL (both legs, live)\n"
-    "/stoppause - Pause status after repeated stop-outs\n"
-    "/datasource - Candle source: Gate.io futures or Binance spot\n"
-    "/emergency1m - 1-minute emergency Z stop\n"
-    "/maxlosspct - Close trade at loss % of size (0 = off)\n"
-    "/takeprofit - Close trade at profit % of size (0 = off)\n"
-    "/trail - Trailing stop when spread reverses\n"
-    "/shock - Market shock filter after sharp BTC move\n"
-    "/tradelog - Send trade history summary\n"
-    "/portfolio - Balance, exposure and open positions\n"
-    "/pnl - Open, today and total profit/loss\n"
-    "/trades - Closed trades\n"
-    "/stats - Win rate and trade statistics\n"
-    "/edgescan - Compare profit vs fees across timeframes\n"
-    "/pairscan - Scan coin pairs (e.g. /pairscan 15m)\n"
-    "/testalert - Test trade alert notifications\n\n"
-    "QUANTITY\n"
-    "/quantity - Show quantity options\n"
-    "/setnotional - Set leg size in USDT (e.g. /setnotional 100)\n\n"
-    "TRADE REPORTS\n"
-    "/pnl - PnL summary\n"
-    "/trades - Closed trades\n"
-    "/cleartradehistory - Clear closed trades\n\n"
-    "LIVE TRADING (Gate.io futures)\n"
-    "/livemode - Show live mode status\n"
-    "/setdryrun - Toggle paper (true) or live (false confirm)\n"
-    "/setalerts - Mute or unmute trade alerts (on or off)\n"
-    "/livetest - Check keys, balance and sizes\n"
-    "/setleverage - Set leverage (1 to 10)\n"
-    "/setmaxloss - Stop live entries after daily loss ($)\n"
-    "/setmaxnotional - Max live trade size ($, both legs)\n"
-    "/setemergencyz - Stop-loss level in Z\n"
-    "/settimestop - Close trades stuck longer than N hours\n"
-    "/liveminsize - Trade smallest Gate size\n"
-    "/livestatus - Balance and positions\n"
-    "/closeall - Close open position(s) now\n\n"
-    "STRATEGY TUNING (more trades)\n"
-    "/filters - Show current thresholds\n"
-    "/setz - Entry Z-score (e.g. /setz 2.0)\n"
-    "/setzexit - Exit Z-score (e.g. /setzexit 0.5)\n"
-    "/setzstop - Stop-loss Z-score (e.g. /setzstop 3.5)\n"
-    "/setlookback - Candle lookback window (e.g. /setlookback 100)\n"
-    "/setadf - ADF-style limit\n"
-    "/sethalflife - Min and max half-life\n"
-    "/setcooldown - Candles to wait after a close\n"
-    "/setedge - Skip trades that cannot beat fees\n"
-    "/resetconfig - Reset parameters to defaults\n\n"
-    "TIMEFRAME\n"
-    "/settimeframe - Switch timeframe (e.g. /settimeframe 5m)\n\n"
-    "RENEWAL REMINDERS\n"
-    "/renewalstatus - View renewal reminder status\n"
-    "/renewalon - Enable renewal reminders\n"
-    "/renewaloff - Disable renewal reminders\n"
-    "/setrenewal - Set reminder days ahead\n"
-    "/setrenewaltime - Set reminder time in IST\n\n"
-    "Mode: SIMULATION ONLY (DRY_RUN)\n"
-    "No real orders are placed unless live mode is confirmed.\n"
-    "</pre>"
-)
-
 
 def env_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -966,7 +887,29 @@ class StatArbBot:
         arg2 = parts[2] if len(parts) > 2 else ""
 
         if cmd in ("/help", "/start"):
-            await self.send_telegram(HELP_TEXT_HTML, chat_id)
+            await self.send_telegram(
+                "<b>Gate.io Top-100 Stat-Arb Admin Commands</b>\n"
+                "<code>/status</code> - Bot state, mode, open slots &amp; last IST tick\n"
+                "<code>/pnl</code> - Realized, unrealized PnL, equity &amp; W/L record\n"
+                "<code>/top</code> - Top ranked cointegrated pairs &amp; live Z-scores\n"
+                "<code>/trades</code> - Recent closed spread trades\n"
+                "<code>/balance</code> - Equity, notional &amp; hold settings\n"
+                "<code>/config</code> - View editable runtime parameters\n"
+                "<code>/setalerts &lt;on|off&gt;</code> - Mute/unmute trade entry &amp; exit alerts\n"
+                "<code>/setdryrun &lt;true|false&gt; [confirm]</code> - Toggle paper/live mode\n"
+                "<code>/settopn &lt;10-200&gt;</code> - Set TOP_N_COINS\n"
+                "<code>/setlookback &lt;30-300&gt;</code> - Set LOOKBACK\n"
+                "<code>/setmaxpos &lt;1-10&gt;</code> - Set MAX_POSITIONS\n"
+                "<code>/setmaxhold &lt;15-4320&gt;</code> - Set MAX_HOLD_MINUTES\n"
+                "<code>/setnotional &lt;10-10000&gt;</code> - Set NOTIONAL_USDT\n"
+                "<code>/setz &lt;0.5-6.0&gt;</code> - Set Z_ENTRY\n"
+                "<code>/setzexit &lt;0.0-3.0&gt;</code> - Set Z_EXIT\n"
+                "<code>/setzstop &lt;1.5-10.0&gt;</code> - Set Z_STOP\n"
+                "<code>/resetconfig</code> - Reset parameters to defaults\n"
+                "<code>/testalert</code> - Send a sample trade alert\n"
+                "<code>/pause</code> | <code>/resume</code> | <code>/closeall</code>",
+                chat_id,
+            )
             return
 
         if cmd == "/testalert":
@@ -1072,191 +1015,144 @@ class StatArbBot:
                 reply = "▶️ Bot <b>resumed</b>."
 
             elif cmd == "/setalerts":
-                if not arg1:
-                    cur = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
-                    reply = (
-                        f"Current <code>TRADE_ALERTS</code>: <b>{cur}</b>\n"
-                        f"Send <code>/setalerts off</code> to mute or <code>/setalerts on</code> to unmute."
-                    )
+                mode_arg = arg1.lower()
+                if mode_arg in ("on", "true", "1", "unmute"):
+                    cfg["TRADE_ALERTS"] = True
+                    self.store.add_event("CONFIG", "Trade alerts enabled (on) via Telegram")
+                    await self.store.save()
+                    reply = "✅ Trade alerts set to <b>ON</b> (entry/exit notifications active)."
+                elif mode_arg in ("off", "false", "0", "mute"):
+                    cfg["TRADE_ALERTS"] = False
+                    self.store.add_event("CONFIG", "Trade alerts muted (off) via Telegram")
+                    await self.store.save()
+                    reply = "🔇 Trade alerts set to <b>OFF</b> (bot keeps running; direct commands still reply)."
                 else:
-                    mode_arg = arg1.lower()
-                    if mode_arg in ("on", "true", "1", "unmute"):
-                        cfg["TRADE_ALERTS"] = True
-                        self.store.add_event("CONFIG", "Trade alerts enabled (on) via Telegram")
-                        await self.store.save()
-                        reply = "✅ Trade alerts set to <b>ON</b> (entry/exit notifications active)."
-                    elif mode_arg in ("off", "false", "0", "mute"):
-                        cfg["TRADE_ALERTS"] = False
-                        self.store.add_event("CONFIG", "Trade alerts muted (off) via Telegram")
-                        await self.store.save()
-                        reply = "🔇 Trade alerts set to <b>OFF</b> (bot keeps running; direct commands still reply)."
-                    else:
-                        reply = "Send <code>/setalerts on</code> or <code>/setalerts off</code>."
+                    reply = "Usage: <code>/setalerts on</code> or <code>/setalerts off</code>"
 
             elif cmd == "/setdryrun":
-                if not arg1:
-                    mode_now = "PAPER (True)" if cfg["DRY_RUN"] else "LIVE (False)"
-                    reply = (
-                        f"Current <code>DRY_RUN</code>: <b>{mode_now}</b>\n"
-                        f"Send <code>/setdryrun true</code> for paper or <code>/setdryrun false confirm</code> for live."
-                    )
-                else:
-                    v = arg1.lower()
-                    if v == "true":
-                        cfg["DRY_RUN"] = True
-                        self.store.add_event("CONFIG", "DRY_RUN set to True via Telegram")
-                        await self.store.save()
-                        reply = "✅ <code>DRY_RUN</code> set to <code>True</code> (Paper Trading)."
-                    elif v == "false":
-                        if arg2.lower() != "confirm":
-                            reply = "⚠️ Live mode places real Gate.io orders. Send <code>/setdryrun false confirm</code> to activate."
-                        elif not GATE_API_KEY or not GATE_API_SECRET:
-                            reply = "❌ Cannot enable live mode: <code>GATE_API_KEY</code> or <code>GATE_API_SECRET</code> is missing in Voroa."
-                        else:
-                            cfg["DRY_RUN"] = False
-                            self.store.add_event("CONFIG", "DRY_RUN set to False (LIVE) via Telegram")
-                            await self.store.save()
-                            reply = "🚨 <code>DRY_RUN</code> set to <code>False</code> (<b>LIVE TRADING ENABLED</b>)."
+                v = arg1.lower()
+                if v == "true":
+                    cfg["DRY_RUN"] = True
+                    self.store.add_event("CONFIG", "DRY_RUN set to True via Telegram")
+                    await self.store.save()
+                    reply = "✅ <code>DRY_RUN</code> set to <code>True</code> (Paper Trading)."
+                elif v == "false":
+                    if arg2.lower() != "confirm":
+                        reply = "⚠️ Live mode places real Gate.io orders. Send <code>/setdryrun false confirm</code> to activate."
+                    elif not GATE_API_KEY or not GATE_API_SECRET:
+                        reply = "❌ Cannot enable live mode: <code>GATE_API_KEY</code> or <code>GATE_API_SECRET</code> is missing in Voroa."
                     else:
-                        reply = "Send <code>/setdryrun true</code> or <code>/setdryrun false confirm</code>."
+                        cfg["DRY_RUN"] = False
+                        self.store.add_event("CONFIG", "DRY_RUN set to False (LIVE) via Telegram")
+                        await self.store.save()
+                        reply = "🚨 <code>DRY_RUN</code> set to <code>False</code> (<b>LIVE TRADING ENABLED</b>)."
+                else:
+                    reply = "Usage: <code>/setdryrun true</code> or <code>/setdryrun false confirm</code>"
 
             elif cmd == "/settopn":
-                if not arg1:
-                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–200). Example: <code>/settopn 80</code>"
-                else:
-                    try:
-                        val = int(arg1)
-                        if not (10 <= val <= 200):
-                            raise ValueError
-                        cfg["TOP_N_COINS"] = val
-                        self.store.add_event("CONFIG", f"TOP_N_COINS updated to {val}")
-                        await self.store.save()
-                        reply = f"✅ <code>TOP_N_COINS</code> updated to <code>{val}</code>."
-                    except ValueError:
-                        reply = f"Enter a whole number from 10 to 200 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 80</code>"
+                try:
+                    val = int(arg1)
+                    if not (10 <= val <= 200):
+                        raise ValueError
+                    cfg["TOP_N_COINS"] = val
+                    self.store.add_event("CONFIG", f"TOP_N_COINS updated to {val}")
+                    await self.store.save()
+                    reply = f"✅ <code>TOP_N_COINS</code> updated to <code>{val}</code>."
+                except ValueError:
+                    reply = "Usage: <code>/settopn &lt;10-200&gt;</code> (e.g. <code>/settopn 80</code>)"
 
             elif cmd == "/setlookback":
-                if not arg1:
-                    reply = f"Current <code>LOOKBACK</code>: <code>{cfg['LOOKBACK']}</code> bars (range 30–300). Example: <code>/setlookback 120</code>"
-                else:
-                    try:
-                        val = int(arg1)
-                        if not (30 <= val <= 300):
-                            raise ValueError
-                        cfg["LOOKBACK"] = val
-                        self.store.add_event("CONFIG", f"LOOKBACK updated to {val}")
-                        await self.store.save()
-                        reply = f"✅ <code>LOOKBACK</code> updated to <code>{val}</code> bars."
-                    except ValueError:
-                        reply = f"Enter a whole number from 30 to 300 (current: <code>{cfg['LOOKBACK']}</code>). Example: <code>/setlookback 120</code>"
+                try:
+                    val = int(arg1)
+                    if not (30 <= val <= 300):
+                        raise ValueError
+                    cfg["LOOKBACK"] = val
+                    self.store.add_event("CONFIG", f"LOOKBACK updated to {val}")
+                    await self.store.save()
+                    reply = f"✅ <code>LOOKBACK</code> updated to <code>{val}</code> bars."
+                except ValueError:
+                    reply = "Usage: <code>/setlookback &lt;30-300&gt;</code> (e.g. <code>/setlookback 120</code>)"
 
             elif cmd == "/setmaxpos":
-                if not arg1:
-                    reply = f"Current <code>MAX_POSITIONS</code>: <code>{cfg['MAX_POSITIONS']}</code> (range 1–10). Example: <code>/setmaxpos 4</code>"
-                else:
-                    try:
-                        val = int(arg1)
-                        if not (1 <= val <= 10):
-                            raise ValueError
-                        cfg["MAX_POSITIONS"] = val
-                        self.store.add_event("CONFIG", f"MAX_POSITIONS updated to {val}")
-                        await self.store.save()
-                        reply = f"✅ <code>MAX_POSITIONS</code> updated to <code>{val}</code>."
-                    except ValueError:
-                        reply = f"Enter a whole number from 1 to 10 (current: <code>{cfg['MAX_POSITIONS']}</code>). Example: <code>/setmaxpos 4</code>"
+                try:
+                    val = int(arg1)
+                    if not (1 <= val <= 10):
+                        raise ValueError
+                    cfg["MAX_POSITIONS"] = val
+                    self.store.add_event("CONFIG", f"MAX_POSITIONS updated to {val}")
+                    await self.store.save()
+                    reply = f"✅ <code>MAX_POSITIONS</code> updated to <code>{val}</code>."
+                except ValueError:
+                    reply = "Usage: <code>/setmaxpos &lt;1-10&gt;</code> (e.g. <code>/setmaxpos 4</code>)"
 
             elif cmd == "/setmaxhold":
-                if not arg1:
-                    reply = f"Current <code>MAX_HOLD_MINUTES</code>: <code>{cfg['MAX_HOLD_MINUTES']}</code> min (range 15–4320). Example: <code>/setmaxhold 480</code>"
-                else:
-                    try:
-                        val = int(arg1)
-                        if not (15 <= val <= 4320):
-                            raise ValueError
-                        cfg["MAX_HOLD_MINUTES"] = val
-                        self.store.add_event("CONFIG", f"MAX_HOLD_MINUTES updated to {val}")
-                        await self.store.save()
-                        reply = f"✅ <code>MAX_HOLD_MINUTES</code> updated to <code>{val}</code> min."
-                    except ValueError:
-                        reply = f"Enter minutes from 15 to 4320 (current: <code>{cfg['MAX_HOLD_MINUTES']}</code>). Example: <code>/setmaxhold 480</code>"
+                try:
+                    val = int(arg1)
+                    if not (15 <= val <= 4320):
+                        raise ValueError
+                    cfg["MAX_HOLD_MINUTES"] = val
+                    self.store.add_event("CONFIG", f"MAX_HOLD_MINUTES updated to {val}")
+                    await self.store.save()
+                    reply = f"✅ <code>MAX_HOLD_MINUTES</code> updated to <code>{val}</code> min."
+                except ValueError:
+                    reply = "Usage: <code>/setmaxhold &lt;15-4320&gt;</code> (e.g. <code>/setmaxhold 480</code>)"
 
             elif cmd == "/setnotional":
-                if not arg1:
-                    reply = f"Current <code>NOTIONAL_USDT</code>: <code>{cfg['NOTIONAL_USDT']}</code> USDT (range 10–10000). Example: <code>/setnotional 150</code>"
-                else:
-                    try:
-                        val = float(arg1)
-                        if not (10.0 <= val <= 10000.0):
-                            raise ValueError
-                        cfg["NOTIONAL_USDT"] = round(val, 2)
-                        self.store.add_event("CONFIG", f"NOTIONAL_USDT updated to {cfg['NOTIONAL_USDT']}")
-                        await self.store.save()
-                        reply = f"✅ <code>NOTIONAL_USDT</code> updated to <code>{cfg['NOTIONAL_USDT']}</code> USDT."
-                    except ValueError:
-                        reply = f"Enter USDT from 10 to 10000 (current: <code>{cfg['NOTIONAL_USDT']}</code>). Example: <code>/setnotional 150</code>"
+                try:
+                    val = float(arg1)
+                    if not (10.0 <= val <= 10000.0):
+                        raise ValueError
+                    cfg["NOTIONAL_USDT"] = round(val, 2)
+                    self.store.add_event("CONFIG", f"NOTIONAL_USDT updated to {cfg['NOTIONAL_USDT']}")
+                    await self.store.save()
+                    reply = f"✅ <code>NOTIONAL_USDT</code> updated to <code>{cfg['NOTIONAL_USDT']}</code> USDT."
+                except ValueError:
+                    reply = "Usage: <code>/setnotional &lt;10-10000&gt;</code> (e.g. <code>/setnotional 150</code>)"
 
             elif cmd == "/setz":
-                if not arg1:
-                    reply = (
-                        f"Current <code>Z_ENTRY</code>: <code>{cfg['Z_ENTRY']}</code> "
-                        f"(must stay between <code>{cfg['Z_EXIT']}</code> and <code>{cfg['Z_STOP']}</code>). Example: <code>/setz 2.2</code>"
-                    )
-                else:
-                    try:
-                        val = float(arg1)
-                        if not (0.5 <= val <= 6.0):
-                            raise ValueError
-                        if not (float(cfg["Z_EXIT"]) < val < float(cfg["Z_STOP"])):
-                            reply = f"❌ Must satisfy <code>Z_EXIT ({cfg['Z_EXIT']}) &lt; Z_ENTRY &lt; Z_STOP ({cfg['Z_STOP']})</code>."
-                        else:
-                            cfg["Z_ENTRY"] = round(val, 4)
-                            self.store.add_event("CONFIG", f"Z_ENTRY updated to {cfg['Z_ENTRY']}")
-                            await self.store.save()
-                            reply = f"✅ <code>Z_ENTRY</code> updated to <code>{cfg['Z_ENTRY']}</code>."
-                    except ValueError:
-                        reply = f"Enter a number from 0.5 to 6.0 (current: <code>{cfg['Z_ENTRY']}</code>). Example: <code>/setz 2.2</code>"
+                try:
+                    val = float(arg1)
+                    if not (0.5 <= val <= 6.0):
+                        raise ValueError
+                    if not (float(cfg["Z_EXIT"]) < val < float(cfg["Z_STOP"])):
+                        reply = f"❌ Must satisfy <code>Z_EXIT ({cfg['Z_EXIT']}) &lt; Z_ENTRY &lt; Z_STOP ({cfg['Z_STOP']})</code>."
+                    else:
+                        cfg["Z_ENTRY"] = round(val, 4)
+                        self.store.add_event("CONFIG", f"Z_ENTRY updated to {cfg['Z_ENTRY']}")
+                        await self.store.save()
+                        reply = f"✅ <code>Z_ENTRY</code> updated to <code>{cfg['Z_ENTRY']}</code>."
+                except ValueError:
+                    reply = "Usage: <code>/setz &lt;0.5-6.0&gt;</code> (e.g. <code>/setz 2.2</code>)"
 
             elif cmd == "/setzexit":
-                if not arg1:
-                    reply = (
-                        f"Current <code>Z_EXIT</code>: <code>{cfg['Z_EXIT']}</code> "
-                        f"(must stay below <code>Z_ENTRY {cfg['Z_ENTRY']}</code>). Example: <code>/setzexit 0.4</code>"
-                    )
-                else:
-                    try:
-                        val = float(arg1)
-                        if not (0.0 <= val <= 3.0):
-                            raise ValueError
-                        if val >= float(cfg["Z_ENTRY"]):
-                            reply = f"❌ Must be strictly less than <code>Z_ENTRY ({cfg['Z_ENTRY']})</code>."
-                        else:
-                            cfg["Z_EXIT"] = round(val, 4)
-                            self.store.add_event("CONFIG", f"Z_EXIT updated to {cfg['Z_EXIT']}")
-                            await self.store.save()
-                            reply = f"✅ <code>Z_EXIT</code> updated to <code>{cfg['Z_EXIT']}</code>."
-                    except ValueError:
-                        reply = f"Enter a number from 0.0 to 3.0 (current: <code>{cfg['Z_EXIT']}</code>). Example: <code>/setzexit 0.4</code>"
+                try:
+                    val = float(arg1)
+                    if not (0.0 <= val <= 3.0):
+                        raise ValueError
+                    if val >= float(cfg["Z_ENTRY"]):
+                        reply = f"❌ Must be strictly less than <code>Z_ENTRY ({cfg['Z_ENTRY']})</code>."
+                    else:
+                        cfg["Z_EXIT"] = round(val, 4)
+                        self.store.add_event("CONFIG", f"Z_EXIT updated to {cfg['Z_EXIT']}")
+                        await self.store.save()
+                        reply = f"✅ <code>Z_EXIT</code> updated to <code>{cfg['Z_EXIT']}</code>."
+                except ValueError:
+                    reply = "Usage: <code>/setzexit &lt;0.0-3.0&gt;</code> (e.g. <code>/setzexit 0.4</code>)"
 
             elif cmd == "/setzstop":
-                if not arg1:
-                    reply = (
-                        f"Current <code>Z_STOP</code>: <code>{cfg['Z_STOP']}</code> "
-                        f"(must stay above <code>Z_ENTRY {cfg['Z_ENTRY']}</code>). Example: <code>/setzstop 4.0</code>"
-                    )
-                else:
-                    try:
-                        val = float(arg1)
-                        if not (1.5 <= val <= 10.0):
-                            raise ValueError
-                        if val <= float(cfg["Z_ENTRY"]):
-                            reply = f"❌ Must be strictly greater than <code>Z_ENTRY ({cfg['Z_ENTRY']})</code>."
-                        else:
-                            cfg["Z_STOP"] = round(val, 4)
-                            self.store.add_event("CONFIG", f"Z_STOP updated to {cfg['Z_STOP']}")
-                            await self.store.save()
-                            reply = f"✅ <code>Z_STOP</code> updated to <code>{cfg['Z_STOP']}</code>."
-                    except ValueError:
-                        reply = f"Enter a number from 1.5 to 10.0 (current: <code>{cfg['Z_STOP']}</code>). Example: <code>/setzstop 4.0</code>"
+                try:
+                    val = float(arg1)
+                    if not (1.5 <= val <= 10.0):
+                        raise ValueError
+                    if val <= float(cfg["Z_ENTRY"]):
+                        reply = f"❌ Must be strictly greater than <code>Z_ENTRY ({cfg['Z_ENTRY']})</code>."
+                    else:
+                        cfg["Z_STOP"] = round(val, 4)
+                        self.store.add_event("CONFIG", f"Z_STOP updated to {cfg['Z_STOP']}")
+                        await self.store.save()
+                        reply = f"✅ <code>Z_STOP</code> updated to <code>{cfg['Z_STOP']}</code>."
+                except ValueError:
+                    reply = "Usage: <code>/setzstop &lt;1.5-10.0&gt;</code> (e.g. <code>/setzstop 4.0</code>)"
 
             else:
                 reply = "Unknown command. Send <code>/help</code> to view all commands."
