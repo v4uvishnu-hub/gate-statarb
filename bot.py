@@ -59,7 +59,6 @@ state = {
     "events": [],
 }
 
-# Candle cache: contract_name -> pd.DataFrame
 candle_cache: dict[str, pd.DataFrame] = {}
 
 
@@ -81,7 +80,6 @@ def make_exchange():
 
 
 def to_gate_contract(ccxt_symbol: str) -> str:
-    # "ETH/USDT:USDT" -> "ETH_USDT"
     base = ccxt_symbol.split("/")[0]
     return f"{base}_USDT"
 
@@ -123,7 +121,6 @@ def busy_symbols() -> set[str]:
 
 
 async def fetch_top_usdt_contracts(session: ClientSession, limit: int = 100) -> list[str]:
-    """Single HTTP GET to Gate.io futures tickers — returns top 100 symbols in <0.5s."""
     url = f"{GATE_FUTURES_BASE}/tickers"
     async with session.get(url) as resp:
         data = await resp.json()
@@ -141,10 +138,6 @@ async def fetch_top_usdt_contracts(session: ClientSession, limit: int = 100) -> 
 
 
 async def fetch_candles_fast(session: ClientSession, symbols: list[str]) -> dict[str, pd.DataFrame]:
-    """
-    Fetches candles concurrently via aiohttp without CCXT global lock bottlenecks.
-    Fetches 115 candles on cold cache, and only the latest 6 candles on warm cache.
-    """
     sem = asyncio.Semaphore(16)
     needed = engine.lookback + 15
 
@@ -182,9 +175,27 @@ async def fetch_candles_fast(session: ClientSession, symbols: list[str]) -> dict
     return {s: candle_cache[s] for s in symbols if s in candle_cache and len(candle_cache[s]) >= engine.lookback}
 
 
-async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict:
-    qy = float(ex.amount_to_precision(pair_y, NOTIONAL_USDT / m["price_y"]))
-    qx = float(ex.amount_to_precision(pair_x, (NOTIONAL_USDT * abs(m["beta"])) / m["price_x"]))
+async def open_spread(ex, pair_y: str, pair_x: str, sig: str, m: dict) -> dict | None:
+    mkt_y = ex.markets.get(pair_y, {})
+    mkt_x = ex.markets.get(pair_x, {})
+
+    min_y = float((((mkt_y.get("limits") or {}).get("amount") or {}).get("min")) or 1.0)
+    min_x = float((((mkt_x.get("limits") or {}).get("amount") or {}).get("min")) or 1.0)
+
+    raw_qy = max(NOTIONAL_USDT / max(m["price_y"], 1e-12), min_y)
+    raw_qx = max((NOTIONAL_USDT * abs(m["beta"])) / max(m["price_x"], 1e-12), min_x)
+
+    try:
+        qy = float(ex.amount_to_precision(pair_y, raw_qy))
+        qx = float(ex.amount_to_precision(pair_x, raw_qx))
+    except Exception as e:
+        log.warning(f"Precision error for {pair_y}/{pair_x}: {e}")
+        return None
+
+    if qy < min_y or qx < min_x or qy <= 0 or qx <= 0:
+        log.warning(f"Skipping {pair_y}/{pair_x}: qty below min ({qy}<{min_y} or {qx}<{min_x})")
+        return None
+
     sy, sx = ("buy", "sell") if sig == "LONG_SPREAD" else ("sell", "buy")
 
     if not DRY_RUN:
@@ -714,7 +725,6 @@ async def trader_loop(tg_app: Application):
                             f"Initial scan finished in {elapsed}s ({len(ohlcv_map)} coins, {state['ready_count']} entry-ready)"
                         )
 
-                    # 1. Manage existing open positions
                     for pos in list(state["positions"]):
                         py, px = pos["pair_y"], pos["pair_x"]
                         if py in ohlcv_map and px in ohlcv_map:
@@ -739,7 +749,6 @@ async def trader_loop(tg_app: Application):
 
                     refresh_unrealized_pnl(ohlcv_map)
 
-                    # 2. Update chart focus
                     if state["positions"]:
                         focus = state["positions"][0]
                         py, px = focus["pair_y"], focus["pair_x"]
@@ -751,7 +760,6 @@ async def trader_loop(tg_app: Application):
                         state["active_pair_y"], state["active_pair_x"] = best["pair_y"], best["pair_x"]
                         state["metrics"] = best
 
-                    # 3. Auto-select & enter top cointegrated pairs meeting entry Z-score
                     if state["running"] and len(state["positions"]) < MAX_POSITIONS:
                         used = busy_symbols()
                         for cand in ranked_pairs:
@@ -766,6 +774,8 @@ async def trader_loop(tg_app: Application):
                                 pos_rec = await open_spread(
                                     ex, cand["pair_y"], cand["pair_x"], sig, cand
                                 )
+                                if not pos_rec:
+                                    continue
                                 used.add(cand["pair_y"])
                                 used.add(cand["pair_x"])
                                 state["active_pair_y"], state["active_pair_x"] = cand["pair_y"], cand["pair_x"]
