@@ -46,7 +46,7 @@ def add_event(msg: str):
 
 
 def make_exchange():
-    return ccxt.gateio({
+    return ccxt.gate({
         "apiKey": GATE_API_KEY,
         "secret": GATE_API_SECRET,
         "enableRateLimit": True,
@@ -237,7 +237,7 @@ async def cmd_setz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = float(context.args[0])
         if val <= 0 or val >= engine.z_stop:
-            await update.message.reply_text(f"Enter a value > 0 and < {engine.z_stop}.")
+            await update.message.reply_text(f"Enter a value greater than 0 and less than {engine.z_stop}.")
             return
         engine.z_entry = val
         add_event(f"Z-entry updated to ±{val:.2f}")
@@ -293,6 +293,10 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth(update):
         return
     await update.message.reply_text("Unknown command. Send /help.")
+
+
+async def tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error(f"Telegram error: {context.error}", exc_info=context.error)
 
 
 # ---------------- Trading Loop ----------------
@@ -353,6 +357,7 @@ def main():
     tg_app.add_handler(CommandHandler("closeall", cmd_closeall))
     tg_app.add_handler(CommandHandler("help", cmd_help))
     tg_app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
+    tg_app.add_error_handler(tg_error_handler)
     tg_app.run_polling(drop_pending_updates=True)
 
 
