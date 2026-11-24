@@ -46,6 +46,8 @@ class StatArbEngine:
         adf_threshold: float = -2.86,
         min_half_life: float = 2.0,
         max_half_life: float = 60.0,
+        notional_usdt: float = 100.0,
+        round_trip_fee_rate: float = 0.002,  # 2 legs * (entry + exit) * ~0.05% taker
     ):
         self.lookback = lookback
         self.z_entry = z_entry
@@ -54,6 +56,8 @@ class StatArbEngine:
         self.adf_threshold = adf_threshold
         self.min_half_life = min_half_life
         self.max_half_life = max_half_life
+        self.notional_usdt = notional_usdt
+        self.round_trip_fee_rate = round_trip_fee_rate
 
     def compute_metrics(self, df_y: pd.DataFrame, df_x: pd.DataFrame) -> dict:
         n = min(self.lookback, len(df_y), len(df_x))
@@ -63,14 +67,26 @@ class StatArbEngine:
         x_mean = np.mean(x)
         y_mean = np.mean(y)
         denom = np.sum((x - x_mean) ** 2) + 1e-12
-        beta = np.sum((x - x_mean) * (y - y_mean)) / denom
-        alpha = y_mean - beta * x_mean
+        beta = float(np.sum((x - x_mean) * (y - y_mean)) / denom)
+        alpha = float(y_mean - beta * x_mean)
 
         spread = y - (alpha + beta * x)
-        z_series = (spread - np.mean(spread)) / (np.std(spread, ddof=1) + 1e-12)
+        spread_mean = float(np.mean(spread))
+        spread_std = float(np.std(spread, ddof=1)) + 1e-12
+        z_series = (spread - spread_mean) / spread_std
+
         adf_stat = _adf_tstat(spread)
         hl = _half_life(spread)
         corr = float(np.corrcoef(np.diff(y), np.diff(x))[0, 1]) if n > 5 else 0.0
+
+        # Expected log-spread reversion toward mean (clamped to z_exit target)
+        z_now = float(z_series[-1])
+        expected_revert_z = max(0.0, abs(z_now) - self.z_exit)
+        expected_log_edge = expected_revert_z * spread_std
+        gross_edge_pct = (np.exp(min(expected_log_edge, 1.0)) - 1.0) * 100.0
+        fee_pct = self.round_trip_fee_rate * 100.0
+        net_edge_pct = float(gross_edge_pct - fee_pct)
+        net_edge_usdt = float((net_edge_pct / 100.0) * self.notional_usdt)
 
         is_cointegrated = (
             0.3 <= abs(beta) <= 3.0
@@ -78,16 +94,21 @@ class StatArbEngine:
             and adf_stat <= self.adf_threshold
             and self.min_half_life <= hl <= self.max_half_life
         )
-        z_now = float(z_series[-1])
         entry_ready = bool(is_cointegrated and self.z_entry <= abs(z_now) < self.z_stop)
 
         return {
-            "beta": float(beta),
+            "alpha": alpha,
+            "beta": beta,
+            "spread_now": float(spread[-1]),
+            "spread_mean": spread_mean,
+            "spread_std": spread_std,
             "z_score": z_now,
             "z_history": [round(float(v), 3) for v in z_series[-40:]],
             "adf_stat": float(adf_stat),
             "half_life": float(hl) if np.isfinite(hl) else 999.0,
-            "corr": float(corr),
+            "corr": corr,
+            "edge_pct": round(net_edge_pct, 3),
+            "edge_usdt": round(net_edge_usdt, 3),
             "is_cointegrated": bool(is_cointegrated),
             "entry_ready": entry_ready,
             "price_y": float(df_y["close"].iloc[-1]),
@@ -95,10 +116,6 @@ class StatArbEngine:
         }
 
     def scan_universe(self, ohlcv_map: dict[str, pd.DataFrame], anchor_count: int = 8) -> list[dict]:
-        """
-        Screens top liquid coins against top `anchor_count` leaders.
-        Prioritizes pairs that meet BOTH cointegration AND entry Z-score criteria first.
-        """
         symbols = list(ohlcv_map.keys())
         anchors = symbols[:anchor_count]
         results = []
@@ -116,10 +133,9 @@ class StatArbEngine:
                 m = self.compute_metrics(ohlcv_map[y_sym], ohlcv_map[x_sym])
                 m["pair_y"] = y_sym
                 m["pair_x"] = x_sym
-                m["score"] = (-m["adf_stat"]) + min(abs(m["z_score"]), 3.5) * 0.5
+                m["score"] = round((-m["adf_stat"]) + min(abs(m["z_score"]), 3.5) * 0.5 + max(m["edge_pct"], -2.0) * 0.25, 3)
                 results.append(m)
 
-        # Sort order: (1) Entry criteria met right now, (2) Cointegrated, (3) Composite score
         results.sort(
             key=lambda r: (r["entry_ready"], r["is_cointegrated"], r["score"]),
             reverse=True,
