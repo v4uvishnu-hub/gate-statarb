@@ -19,9 +19,11 @@ API_KEY = os.getenv("GATE_API_KEY", "").strip()
 API_SECRET = os.getenv("GATE_API_SECRET", "").strip()
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"
 
-# Automatically runs in paper-execution mode when API keys are omitted
 HAS_PRIVATE_KEYS = bool(API_KEY and API_SECRET)
-PAPER_MODE = os.getenv("PAPER_MODE", "true" if not HAS_PRIVATE_KEYS else "false").lower() == "true" or not HAS_PRIVATE_KEYS
+PAPER_MODE = (
+    os.getenv("PAPER_MODE", "true" if not HAS_PRIVATE_KEYS else "false").lower() == "true"
+    or not HAS_PRIVATE_KEYS
+)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_STATE_KEY = "atr_trend_bot:state"
@@ -63,6 +65,7 @@ STOP_ATR_MULT = float(os.getenv("STOP_ATR_MULT", "1.5"))
 TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "2.0"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
 PULLBACK_ATR_BAND = float(os.getenv("PULLBACK_ATR_BAND", "0.75"))
+EMA20_GUARD_PCT = float(os.getenv("EMA20_GUARD_PCT", "0.003"))
 MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "24.0"))
 
 POLL_INTERVAL_SEC = 60
@@ -127,6 +130,8 @@ def load_state() -> dict:
             data.setdefault("pin_message_id", None)
             data.setdefault("last_scan", None)
             data.setdefault("scan_cursor", 0)
+            data.setdefault("pullback_atr_band", PULLBACK_ATR_BAND)
+            data.setdefault("risk_per_trade_usdt", RISK_PER_TRADE_USDT)
             return data
         except json.JSONDecodeError:
             logging.error("Corrupted Redis state JSON; resetting to default.")
@@ -137,6 +142,8 @@ def load_state() -> dict:
         "pin_message_id": None,
         "last_scan": None,
         "scan_cursor": 0,
+        "pullback_atr_band": PULLBACK_ATR_BAND,
+        "risk_per_trade_usdt": RISK_PER_TRADE_USDT,
     }
 
 
@@ -144,6 +151,19 @@ def save_state(state: dict):
     state["active_trades"] = list(state.get("active_trades") or [])
     state["active_trade"] = state["active_trades"][0] if state["active_trades"] else None
     rds.set(REDIS_STATE_KEY, json.dumps(state))
+
+
+def get_runtime_strategy_params(state: dict | None = None) -> tuple[float, float]:
+    st = state if state is not None else load_state()
+    try:
+        band = float(st.get("pullback_atr_band", PULLBACK_ATR_BAND))
+    except (TypeError, ValueError):
+        band = PULLBACK_ATR_BAND
+    try:
+        risk = float(st.get("risk_per_trade_usdt", RISK_PER_TRADE_USDT))
+    except (TypeError, ValueError):
+        risk = RISK_PER_TRADE_USDT
+    return max(0.05, min(10.0, band)), max(1.0, min(100000.0, risk))
 
 
 def record_scan_diagnostics(
@@ -223,6 +243,16 @@ def load_trade_history(limit: int = 25) -> list[dict]:
         except json.JSONDecodeError:
             logging.warning("Skipping malformed trade record in Redis history.")
     return rows
+
+
+def reset_trade_stats_and_history() -> dict:
+    empty_stats = {"total_trades": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0}
+    with state_lock:
+        pipe = rds.pipeline()
+        pipe.set(REDIS_STATS_KEY, json.dumps(empty_stats))
+        pipe.delete(REDIS_HISTORY_KEY)
+        pipe.execute()
+    return empty_stats
 
 
 # ==========================================
@@ -385,11 +415,18 @@ def calc_unrealized_pnl(trade: dict, mark_price: float) -> float:
     return (entry - mark_price) * amt * contract_size
 
 
-def compute_order_amount(market: dict, symbol: str, spot: float, stop_distance: float) -> float:
+def compute_order_amount(
+    market: dict,
+    symbol: str,
+    spot: float,
+    stop_distance: float,
+    risk_usdt: float | None = None,
+) -> float:
     if stop_distance <= 0 or spot <= 0:
         return 0.0
+    budget = RISK_PER_TRADE_USDT if risk_usdt is None else float(risk_usdt)
     contract_size = float(market.get("contractSize") or 1.0)
-    raw_qty = RISK_PER_TRADE_USDT / (stop_distance * contract_size)
+    raw_qty = budget / (stop_distance * contract_size)
     min_amt = float((market.get("limits") or {}).get("amount", {}).get("min") or 0.001)
     qty = max(min_amt, raw_qty)
     return float(exchange.amount_to_precision(symbol, qty))
@@ -464,6 +501,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     status_flag = "PAUSED" if state.get("paused") else "RUNNING"
     pin_sec = int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC))
+    band, risk_usdt = get_runtime_strategy_params(state)
     trades = state.get("active_trades") or []
     last_scan = state.get("last_scan")
 
@@ -501,6 +539,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
         f"{position_block}\n\n"
         f"<b>Realized Stats:</b> {wins}W / {losses}L ({win_rate:.1f}%) | "
         f"PnL: <code>{realized:+.4f}</code>\n"
+        f"<b>Params:</b> Band <code>{band}</code> · Risk <code>{risk_usdt:.2f} USDT</code>\n"
         f"<i>Refresh: {pin_sec}s · {now_ist}</i>"
     )
 
@@ -696,6 +735,11 @@ def telegram_command_worker():
                         f"<i>{scan.get('checked_at_ist', '--')}</i>"
                     )
 
+                elif cmd == "/resetstats":
+                    reset_trade_stats_and_history()
+                    send_telegram("<b>Stats &amp; History Reset.</b> Realized PnL, W/L record, and trade history cleared.")
+                    ensure_and_update_pinned_card(force_new=False)
+
                 elif cmd == "/pause":
                     with state_lock:
                         state = load_state()
@@ -760,6 +804,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                 state = load_state()
                 trades = list(state.get("active_trades") or [])
                 paused = bool(state.get("paused", False))
+                pullback_band, risk_usdt = get_runtime_strategy_params(state)
 
             updated_trades: list[dict] = []
             for tr in trades:
@@ -866,15 +911,17 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                     if atr <= 0:
                         continue
 
-                    band = max(1e-8, PULLBACK_ATR_BAND * atr)
+                    band = max(1e-8, pullback_band * atr)
                     trend_bullish = spot > ema_50
                     trend_bearish = spot < ema_50
                     dist_to_20 = abs(spot - ema_20_15m)
+                    long_floor = ema_20_15m * (1.0 - EMA20_GUARD_PCT)
+                    short_ceiling = ema_20_15m * (1.0 + EMA20_GUARD_PCT)
 
                     setup_side = None
-                    if trend_bullish and dist_to_20 <= band and spot >= ema_20_15m * 0.997:
+                    if trend_bullish and dist_to_20 <= band and spot >= long_floor:
                         setup_side = "long"
-                    elif trend_bearish and dist_to_20 <= band and spot <= ema_20_15m * 1.003:
+                    elif trend_bearish and dist_to_20 <= band and spot <= short_ceiling:
                         setup_side = "short"
 
                     if not setup_side:
@@ -898,7 +945,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                         continue
 
                     stop_dist = STOP_ATR_MULT * atr
-                    amt = compute_order_amount(mkt, sym, spot, stop_dist)
+                    amt = compute_order_amount(mkt, sym, spot, stop_dist, risk_usdt=risk_usdt)
                     if amt <= 0:
                         continue
 
@@ -939,7 +986,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                         f"Pair: <code>{sym}</code> | Qty: <code>{amt}</code>\n"
                         f"Entry: <code>{_fmt_px(entry_px)}</code> | Stop: <code>{_fmt_px(stop_px)}</code> | "
                         f"TP: <code>{_fmt_px(tp_px)}</code>\n"
-                        f"Risk Cap: <code>{RISK_PER_TRADE_USDT:.2f} USDT</code>"
+                        f"Risk Cap: <code>{risk_usdt:.2f} USDT</code> · Band: <code>{pullback_band}</code>"
                     )
                     ensure_and_update_pinned_card(force_new=False)
 
@@ -985,6 +1032,11 @@ class CloseSymbolPayload(BaseModel):
     symbol: str
 
 
+class StrategyConfigPayload(BaseModel):
+    pullback_atr_band: float
+    risk_per_trade_usdt: float
+
+
 def _verify_token(token: str | None):
     if WEB_UI_TOKEN and token != WEB_UI_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid dashboard token")
@@ -1013,6 +1065,7 @@ def healthz():
         st = load_state()
         paused = bool(st.get("paused", False))
         active_cnt = len(st.get("active_trades") or [])
+        band, risk_usdt = get_runtime_strategy_params(st)
     return {
         "status": "ok" if redis_ok else "degraded",
         "redis": redis_ok,
@@ -1023,6 +1076,8 @@ def healthz():
         "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
         "max_open_positions": MAX_OPEN_POSITIONS,
         "active_positions_count": active_cnt,
+        "pullback_atr_band": band,
+        "risk_per_trade_usdt": risk_usdt,
         "paused": paused,
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
     }
@@ -1034,6 +1089,7 @@ def api_state():
         state = load_state()
         stats = load_stats()
         history_raw = load_trade_history(limit=25)
+        active_band, active_risk = get_runtime_strategy_params(state)
 
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     trades = state.get("active_trades") or []
@@ -1081,6 +1137,8 @@ def api_state():
         "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
         "pinned_symbols": PINNED_SYMBOLS,
         "max_open_positions": MAX_OPEN_POSITIONS,
+        "pullback_atr_band": active_band,
+        "risk_per_trade_usdt": active_risk,
         "paused": bool(state.get("paused", False)),
         "pin_interval_sec": int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)),
         "last_scan": state.get("last_scan"),
@@ -1095,6 +1153,39 @@ def api_state():
 def api_scan_now(token: str | None = None):
     _verify_token(token)
     return perform_scan_cycle()
+
+
+@app.post("/api/strategy-config")
+def api_strategy_config(payload: StrategyConfigPayload, token: str | None = None):
+    _verify_token(token)
+    if payload.pullback_atr_band < 0.05 or payload.pullback_atr_band > 10.0:
+        raise HTTPException(status_code=400, detail="PULLBACK_ATR_BAND must be between 0.05 and 10.0")
+    if payload.risk_per_trade_usdt < 1.0 or payload.risk_per_trade_usdt > 100000.0:
+        raise HTTPException(status_code=400, detail="RISK_PER_TRADE_USDT must be between 1.0 and 100000.0")
+
+    with state_lock:
+        state = load_state()
+        state["pullback_atr_band"] = round(float(payload.pullback_atr_band), 4)
+        state["risk_per_trade_usdt"] = round(float(payload.risk_per_trade_usdt), 2)
+        save_state(state)
+        band, risk = get_runtime_strategy_params(state)
+
+    send_telegram(
+        f"<b>Web UI Strategy Updated:</b>\n"
+        f"PULLBACK_ATR_BAND: <code>{band}</code>\n"
+        f"RISK_PER_TRADE_USDT: <code>{risk:.2f} USDT</code>"
+    )
+    ensure_and_update_pinned_card(force_new=False)
+    return {"ok": True, "pullback_atr_band": band, "risk_per_trade_usdt": risk}
+
+
+@app.post("/api/reset-stats")
+def api_reset_stats(token: str | None = None):
+    _verify_token(token)
+    stats = reset_trade_stats_and_history()
+    send_telegram("<b>Web UI:</b> Realized trade stats and closed trade history were reset.")
+    ensure_and_update_pinned_card(force_new=False)
+    return {"ok": True, "stats": stats}
 
 
 @app.post("/api/close-position")
@@ -1188,6 +1279,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .bar-bg { width: 100%; height: 8px; background: #1c2536; border-radius: 999px; overflow: hidden; margin-top: 8px; }
   .bar-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .4s ease; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+  .cmd-dropdown { position: relative; display: inline-block; }
+  .cmd-panel {
+    display: none; position: absolute; top: 110%; left: 0; min-width: 240px; z-index: 30;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px; box-shadow: 0 12px 28px rgba(0,0,0,.45);
+  }
+  .cmd-panel.open { display: flex; flex-direction: column; gap: 6px; }
+  .cmd-item {
+    width: 100%; text-align: left; background: #0f1520; color: var(--text);
+    border: 1px solid var(--border); padding: 8px 11px; border-radius: 7px;
+    display: flex; justify-content: space-between; align-items: center; font-size: 0.83rem;
+  }
+  .cmd-item:hover { border-color: var(--blue); background: #162033; }
+  .cmd-item.danger { border-color: rgba(239,68,68,.4); color: #fca5a5; }
+  .cmd-item.danger:hover { background: rgba(239,68,68,.16); }
+  .param-form {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+  }
+  .param-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+  .param-field input {
+    background: #0f1520; border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 8px; width: 140px; font-size: 0.85rem;
+  }
+  .cmd-feedback { margin-top: 10px; font-size: 0.83rem; color: var(--muted); min-height: 18px; }
   button { cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px; font-weight: 600; font-size: 0.85rem; }
   button:disabled { opacity: 0.6; cursor: not-allowed; }
   .btn-primary { background: var(--blue); color: #fff; }
@@ -1236,17 +1352,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="label">Controls</div>
+    <div class="label">Commands Menu</div>
     <div class="controls">
-      <button id="scanNowBtn" class="btn-primary" onclick="scanNow()">Scan Now</button>
-      <button id="toggleBtn" class="btn-warn" onclick="togglePause()">Pause Bot</button>
-      <button class="btn-danger" onclick="emergencyCloseAll()">Emergency /closeall</button>
+      <div class="cmd-dropdown">
+        <button id="cmdMenuBtn" type="button" class="btn-primary" onclick="toggleCmdMenu(event)">Commands ▾</button>
+        <div id="cmdMenuPanel" class="cmd-panel">
+          <button type="button" class="cmd-item" onclick="runMenuCmd('scan')">
+            <span>Run Scan Now</span><code>/scannow</code>
+          </button>
+          <button type="button" class="cmd-item" onclick="runMenuCmd('pause')">
+            <span>Toggle Pause / Resume</span><code>/pause</code>
+          </button>
+          <button type="button" class="cmd-item" onclick="runMenuCmd('reset')">
+            <span>Reset Stats &amp; History</span><code>/resetstats</code>
+          </button>
+          <button type="button" class="cmd-item danger" onclick="runMenuCmd('closeall')">
+            <span>Emergency Close All &amp; Pause</span><code>/closeall</code>
+          </button>
+        </div>
+      </div>
+
+      <button id="scanNowBtn" type="button" class="btn-primary" onclick="scanNow()">Scan Now</button>
+      <button id="toggleBtn" type="button" class="btn-warn" onclick="togglePause()">Pause Bot</button>
+      <button id="resetStatsBtn" type="button" class="btn-warn" onclick="resetStats()">Reset Stats</button>
+      <button type="button" class="btn-danger" onclick="emergencyCloseAll()">Emergency /closeall</button>
+
       <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
-        <span style="font-size:0.85rem; color:var(--muted);">TG Pin Refresh (s):</span>
+        <span style="font-size:0.85rem; color:var(--muted);">TG Pin (s):</span>
         <input id="pinSecInput" type="number" min="10" max="3600" value="30" />
-        <button class="btn-primary" onclick="updatePinSec()">Update</button>
+        <button type="button" class="btn-primary" onclick="updatePinSec()">Set</button>
       </div>
     </div>
+
+    <form id="strategyForm" class="param-form" onsubmit="saveStrategyConfig(event)">
+      <div class="param-field">
+        <label for="pullbackBandInput">PULLBACK_ATR_BAND</label>
+        <input id="pullbackBandInput" type="number" step="0.05" min="0.05" max="10" value="0.75" required />
+      </div>
+      <div class="param-field">
+        <label for="riskUsdtInput">RISK_PER_TRADE_USDT</label>
+        <input id="riskUsdtInput" type="number" step="1" min="1" max="100000" value="25" required />
+      </div>
+      <button id="saveStrategyBtn" type="submit" class="btn-primary">Apply Strategy Params</button>
+    </form>
+
+    <div id="cmdFeedback" class="cmd-feedback">Ready.</div>
   </div>
 
   <div class="card" style="margin-top:16px;">
@@ -1274,6 +1424,46 @@ function fmtPx(v) {
   return Math.abs(n) < 50 ? n.toFixed(4) : n.toFixed(2);
 }
 
+function setCmdFeedback(msg, isErr = false) {
+  const el = document.getElementById("cmdFeedback");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = isErr ? "var(--red)" : "var(--green)";
+}
+
+function toggleCmdMenu(e) {
+  if (e) e.stopPropagation();
+  document.getElementById("cmdMenuPanel").classList.toggle("open");
+}
+
+function closeCmdMenu() {
+  const panel = document.getElementById("cmdMenuPanel");
+  if (panel) panel.classList.remove("open");
+}
+
+document.addEventListener("click", () => closeCmdMenu());
+
+async function runMenuCmd(action) {
+  closeCmdMenu();
+  try {
+    if (action === "scan") {
+      await scanNow();
+      setCmdFeedback("Executed /scannow — scanner diagnostics updated.");
+    } else if (action === "pause") {
+      await togglePause();
+      setCmdFeedback("Toggled bot pause state.");
+    } else if (action === "reset") {
+      await resetStats();
+      setCmdFeedback("Reset realized stats and closed trade history.");
+    } else if (action === "closeall") {
+      await emergencyCloseAll();
+      setCmdFeedback("Executed /closeall and paused bot.");
+    }
+  } catch (err) {
+    setCmdFeedback(`Command error: ${err.message || err}`, true);
+  }
+}
+
 async function fetchState() {
   try {
     const res = await fetch("/api/state");
@@ -1297,6 +1487,15 @@ async function fetchState() {
     const activeTrades = data.active_trades || [];
     const maxPos = data.max_open_positions || 2;
     document.getElementById("slotsVal").textContent = `${activeTrades.length} / ${maxPos}`;
+
+    const bandEl = document.getElementById("pullbackBandInput");
+    const riskEl = document.getElementById("riskUsdtInput");
+    if (bandEl && document.activeElement !== bandEl && data.pullback_atr_band !== undefined) {
+      bandEl.value = data.pullback_atr_band;
+    }
+    if (riskEl && document.activeElement !== riskEl && data.risk_per_trade_usdt !== undefined) {
+      riskEl.value = data.risk_per_trade_usdt;
+    }
 
     const scan = data.last_scan;
     if (scan) {
@@ -1396,6 +1595,36 @@ async function fetchState() {
   }
 }
 
+async function saveStrategyConfig(e) {
+  e.preventDefault();
+  const btn = document.getElementById("saveStrategyBtn");
+  const band = parseFloat(document.getElementById("pullbackBandInput").value);
+  const risk = parseFloat(document.getElementById("riskUsdtInput").value);
+  if (Number.isNaN(band) || band <= 0 || Number.isNaN(risk) || risk <= 0) {
+    setCmdFeedback("Enter valid positive numbers for pullback band and risk USDT.", true);
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "Applying...";
+  try {
+    const res = await fetch(apiUrl("/api/strategy-config"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pullback_atr_band: band, risk_per_trade_usdt: risk }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setCmdFeedback(out.detail || "Failed to update strategy config.", true);
+      return;
+    }
+    setCmdFeedback(`Applied: PULLBACK_ATR_BAND=${out.pullback_atr_band}, RISK_PER_TRADE_USDT=${Number(out.risk_per_trade_usdt).toFixed(2)}`);
+    await fetchState();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Apply Strategy Params";
+  }
+}
+
 async function closeSinglePosition(btn, symbol) {
   if (!confirm(`Close ${symbol} position now? Bot will remain running.`)) return;
   const orig = btn.textContent;
@@ -1407,12 +1636,34 @@ async function closeSinglePosition(btn, symbol) {
     const res = await fetch(`/api/close-position?${qs.toString()}`, { method: "POST" });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(err.detail || `Failed to close ${symbol}`);
+      setCmdFeedback(err.detail || `Failed to close ${symbol}`, true);
+    } else {
+      setCmdFeedback(`Closed ${symbol}.`);
     }
     await fetchState();
   } finally {
     btn.disabled = false;
     btn.textContent = orig;
+  }
+}
+
+async function resetStats() {
+  if (!confirm("Clear all realized PnL stats and closed trade history?")) return;
+  const btn = document.getElementById("resetStatsBtn");
+  btn.disabled = true;
+  btn.textContent = "Resetting...";
+  try {
+    const res = await fetch(apiUrl("/api/reset-stats"), { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      setCmdFeedback(err.detail || "Failed to reset stats", true);
+    } else {
+      setCmdFeedback("Cleared realized stats and trade history.");
+    }
+    await fetchState();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Reset Stats";
   }
 }
 
@@ -1436,6 +1687,7 @@ async function updatePinSec() {
   const sec = parseInt(document.getElementById("pinSecInput").value, 10);
   if (!sec || sec < 10) return;
   await fetch(apiUrl("/api/setpinsec"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ seconds: sec }) });
+  setCmdFeedback(`Updated Telegram pinned card refresh to ${sec}s.`);
   fetchState();
 }
 async function emergencyCloseAll() {
