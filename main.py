@@ -49,7 +49,7 @@ HELP_TEXT_HTML = (
     "/setdailyloss - Set max daily loss USDT guard (0 = off)\n"
     "/setcooldown - Set post-close pair cooldown min (0-1440)\n"
     "/setpinsec - Set synced Web UI &amp; pin refresh sec (3-3600)\n"
-    "/settopn - Set TOP_N_COINS universe size (10-200)\n"
+    "/settopn - Set TOP_N_COINS universe size (10-250)\n"
     "/setlookback - Set LOOKBACK candle window (30-300)\n"
     "/setmaxpos - Set MAX_POSITIONS slot cap (1-10)\n"
     "/setmaxhold - Set MAX_HOLD_MINUTES timer (15-4320)\n"
@@ -94,7 +94,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
         "TG_PIN_REFRESH_SEC": max(3, min(3600, env_int("TG_PIN_REFRESH_SEC", 60))),
         "PAIR_COOLDOWN_MINUTES": max(0.0, min(1440.0, env_float("PAIR_COOLDOWN_MINUTES", 30.0))),
         "MAX_DAILY_LOSS_USDT": max(0.0, min(100000.0, env_float("MAX_DAILY_LOSS_USDT", 50.0))),
-        "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 25))),
+        "TOP_N_COINS": max(10, min(250, env_int("TOP_N_COINS", 50))),
         "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 60))),
         "MAX_POSITIONS": max(1, min(10, env_int("MAX_POSITIONS", 3))),
         "MAX_HOLD_MINUTES": max(15, min(4320, env_int("MAX_HOLD_MINUTES", 720))),
@@ -110,8 +110,8 @@ SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 60))
 TG_PIN_REFRESH_SEC = max(3, min(3600, env_int("TG_PIN_REFRESH_SEC", 60)))
 INITIAL_EQUITY = max(50.0, env_float("INITIAL_EQUITY", 1000.0))
 TAKER_FEE = max(0.0, env_float("TAKER_FEE", 0.0005))
-FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 8)))
-CANDIDATE_POOL_LIMIT = max(10, min(80, env_int("CANDIDATE_POOL_LIMIT", 18)))
+FETCH_CONCURRENCY = max(4, min(20, env_int("FETCH_CONCURRENCY", 8)))
+CANDIDATE_POOL_LIMIT = max(10, min(80, env_int("CANDIDATE_POOL_LIMIT", 28)))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
@@ -1594,18 +1594,18 @@ class StatArbBot:
 
             elif cmd == "/settopn":
                 if not arg1:
-                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–200). Example: <code>/settopn 25</code>"
+                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–250). Example: <code>/settopn 50</code>"
                 else:
                     try:
                         val = int(arg1)
-                        if not (10 <= val <= 200):
+                        if not (10 <= val <= 250):
                             raise ValueError
                         cfg["TOP_N_COINS"] = val
                         self.store.add_event("CONFIG", f"TOP_N_COINS updated to {val}")
                         await self.store.save()
                         reply = f"✅ <code>TOP_N_COINS</code> updated to <code>{val}</code>."
                     except ValueError:
-                        reply = f"Enter a whole number from 10 to 200 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 25</code>"
+                        reply = f"Enter a whole number from 10 to 250 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 50</code>"
 
             elif cmd == "/setlookback":
                 if not arg1:
@@ -1975,7 +1975,7 @@ function renderState(s) {
     " | Mode: " + (cfg.DRY_RUN ? "PAPER" : "LIVE") +
     " | Sync: " + refreshIntervalSec + "s" +
     " | Cooldown: " + (cfg.PAIR_COOLDOWN_MINUTES ?? 30) + "m" +
-    " | Top-" + (cfg.TOP_N_COINS || 25) +
+    " | Top-" + (cfg.TOP_N_COINS || 50) +
     " | Lookback: " + (cfg.LOOKBACK || 60) +
     " | Z (In/Out/Stop): " + cfg.Z_ENTRY + "/" + cfg.Z_EXIT + "/" + cfg.Z_STOP +
     " | Notional: $" + cfg.NOTIONAL_USDT +
