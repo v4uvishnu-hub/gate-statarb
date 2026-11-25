@@ -70,9 +70,12 @@ logging.basicConfig(
 )
 
 # ==========================================
-# CLIENTS & THREAD LOCK
+# CLIENTS, THREAD LOCKS & MARKET CACHE
 # ==========================================
 state_lock = threading.Lock()
+scan_lock = threading.Lock()
+cached_markets: dict = {}
+
 rds = redis.from_url(REDIS_URL, decode_responses=True)
 
 exchange = ccxt.gate({
@@ -319,9 +322,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
             f"Time to Expiry: <code>{hours_left:.1f}h</code>"
         )
     else:
-        scan_note = ""
-        if last_scan:
-            scan_note = f"\n<i>Last Scan: {last_scan.get('reason')}</i>"
+        scan_note = f"\n<i>Last Scan: {last_scan.get('reason')}</i>" if last_scan else ""
         position_block = f"<b>Active Spread:</b> None (Flat / Scanning){scan_note}"
 
     total = int(stats.get("total_trades", 0))
@@ -443,6 +444,31 @@ def telegram_command_worker():
                         state = load_state()
                         stats = load_stats()
                     send_telegram(build_pinned_status_text(state, stats))
+
+                elif cmd == "/scannow":
+                    send_telegram("<b>Scanning now...</b> Running immediate option &amp; trend check.")
+                    result = perform_scan_cycle()
+                    scan = (result or {}).get("last_scan") or {}
+
+                    status = scan.get("status", "UNKNOWN")
+                    reason = scan.get("reason", "No scan details available.")
+                    spot = scan.get("spot")
+                    ema = scan.get("ema_50")
+                    regime = scan.get("spread_label") or "--"
+                    ratio = scan.get("credit_ratio_pct")
+                    checked_at = scan.get("checked_at_ist") or "--"
+
+                    spot_str = f"{float(spot):.2f}" if spot is not None else "--"
+                    ema_str = f"{float(ema):.2f}" if ema is not None else "--"
+                    ratio_str = f"{float(ratio):.2f}%" if ratio is not None else "--"
+
+                    send_telegram(
+                        f"<b>Scan Result [{status}]</b>\n"
+                        f"Spot: <code>{spot_str}</code> | 1h EMA-50: <code>{ema_str}</code>\n"
+                        f"Regime: <code>{regime}</code> | Credit Ratio: <code>{ratio_str}</code>\n"
+                        f"Detail: {reason}\n"
+                        f"<i>{checked_at}</i>"
+                    )
 
                 elif cmd == "/pause":
                     with state_lock:
@@ -900,6 +926,188 @@ def close_spread(short_sym: str, long_sym: str, entry_credit: float) -> float:
 
 
 # ==========================================
+# SCAN & MONITOR CYCLE
+# ==========================================
+def perform_scan_cycle(markets: dict | None = None) -> dict:
+    global cached_markets
+    with scan_lock:
+        active_markets = markets or cached_markets
+        if not active_markets:
+            active_markets = exchange.load_markets()
+            cached_markets = active_markets
+
+        try:
+            with state_lock:
+                state = load_state()
+                active_trade = state.get("active_trade")
+                paused = bool(state.get("paused", False))
+                now_ms = int(time.time() * 1000)
+
+            if active_trade:
+                hours_to_exp = (int(active_trade["expiry_ms"]) - now_ms) / (1000 * 60 * 60)
+                pnl, _ = get_unrealized_pnl(active_trade)
+
+                tp_target = float(active_trade["entry_credit"]) * TAKE_PROFIT_PCT
+                sl_limit = -float(active_trade["entry_credit"]) * STOP_LOSS_MULT
+
+                exit_reason = None
+                if pnl >= tp_target:
+                    exit_reason = "Take Profit (50% Max Credit)"
+                elif pnl <= sl_limit:
+                    exit_reason = "Stop Loss (1.5x Credit)"
+                elif hours_to_exp <= EXIT_HOURS_BEFORE_EXP:
+                    exit_reason = "Time Exit (Pre-Expiry Pin Protection)"
+
+                if exit_reason:
+                    realized = close_spread(
+                        active_trade["short_sym"],
+                        active_trade["long_sym"],
+                        active_trade["entry_credit"],
+                    )
+                    update_stats(realized)
+                    record_closed_trade(active_trade, realized, exit_reason)
+                    with state_lock:
+                        state = load_state()
+                        state["active_trade"] = None
+                        save_state(state)
+
+                    send_telegram(
+                        f"<b>Spread Closed — {exit_reason}</b>\n"
+                        f"Short: <code>{active_trade['short_sym']}</code>\n"
+                        f"Long: <code>{active_trade['long_sym']}</code>\n"
+                        f"Realized PnL: <code>{realized:+.4f}</code>"
+                    )
+                    ensure_and_update_pinned_card(force_new=False)
+                else:
+                    logging.info(
+                        f"Monitoring {active_trade['short_sym']} | "
+                        f"PnL: {pnl:+.4f} | Exp: {hours_to_exp:.1f}h"
+                    )
+                record_scan_diagnostics(
+                    "MONITORING",
+                    f"Active spread {active_trade['short_sym']} PnL={pnl:+.4f} ({hours_to_exp:.1f}h left).",
+                )
+
+            elif paused:
+                msg = "Bot is currently PAUSED; skipping new entries."
+                logging.info(f"[SCAN] {msg}")
+                record_scan_diagnostics("PAUSED", msg)
+
+            else:
+                spot, ema_50 = get_spot_and_ema(50)
+                spread_type = "bull_put" if spot > ema_50 else "bear_call"
+                spread_label = "Bull Put Spread" if spread_type == "bull_put" else "Bear Call Spread"
+
+                legs = find_credit_spread_legs_by_delta(active_markets, spot, spread_type)
+                if not legs:
+                    msg = f"No {spread_label} pair matched DTE ({MIN_DTE}-{MAX_DTE}d) & Delta targets."
+                    logging.info(f"[SCAN] Spot={spot:.2f}, EMA50={ema_50:.2f} | {msg}")
+                    record_scan_diagnostics(
+                        "SKIPPED",
+                        msg,
+                        spot=spot,
+                        ema_50=ema_50,
+                        spread_type=spread_type,
+                        spread_label=spread_label,
+                    )
+                else:
+                    short_leg, long_leg, expiry_ms, width = legs
+                    quote = check_spread_edge(short_leg["symbol"], long_leg["symbol"], width)
+                    if not quote:
+                        msg = (
+                            f"Rejected {short_leg['symbol']} (Δ {short_leg['delta']:+.3f}) / "
+                            f"{long_leg['symbol']} (Δ {long_leg['delta']:+.3f}) due to bid/ask or credit < {MIN_CREDIT_RATIO*100:.0f}%."
+                        )
+                        logging.info(f"[SCAN] {msg}")
+                        record_scan_diagnostics(
+                            "SKIPPED",
+                            msg,
+                            spot=spot,
+                            ema_50=ema_50,
+                            spread_type=spread_type,
+                            spread_label=spread_label,
+                        )
+                    else:
+                        ratio = quote["credit_ratio"]
+                        msg = f"Valid {spread_label} setup! Credit={quote['net_credit']:.4f} ({ratio*100:.2f}% of width)."
+                        logging.info(f"[SCAN] {msg}")
+                        record_scan_diagnostics(
+                            "EXECUTING",
+                            msg,
+                            spot=spot,
+                            ema_50=ema_50,
+                            spread_type=spread_type,
+                            spread_label=spread_label,
+                            credit_ratio=ratio,
+                        )
+
+                        fills = open_spread(short_leg["symbol"], long_leg["symbol"], quote)
+                        if not fills:
+                            fail_msg = "Leg fill/chase incomplete; aborted cleanly with no open position."
+                            logging.warning(f"[SCAN] {fail_msg}")
+                            record_scan_diagnostics(
+                                "SKIPPED",
+                                fail_msg,
+                                spot=spot,
+                                ema_50=ema_50,
+                                spread_type=spread_type,
+                                spread_label=spread_label,
+                                credit_ratio=ratio,
+                            )
+                        else:
+                            actual_credit = float(fills["actual_credit"])
+                            actual_max_loss = width - actual_credit
+                            new_trade = {
+                                "spread_type": spread_type,
+                                "spread_label": spread_label,
+                                "short_sym": short_leg["symbol"],
+                                "long_sym": long_leg["symbol"],
+                                "short_strike": short_leg["strike"],
+                                "long_strike": long_leg["strike"],
+                                "short_delta": short_leg["delta"],
+                                "long_delta": long_leg["delta"],
+                                "short_fill_price": fills["short_fill_price"],
+                                "long_fill_price": fills["long_fill_price"],
+                                "entry_credit": actual_credit,
+                                "max_loss": actual_max_loss,
+                                "expiry_ms": expiry_ms,
+                                "opened_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            with state_lock:
+                                state = load_state()
+                                state["active_trade"] = new_trade
+                                state["last_scan"] = {
+                                    "checked_at_ist": datetime.now(IST).strftime("%d %b %H:%M:%S IST"),
+                                    "status": "OPENED",
+                                    "reason": f"Opened {spread_label} ({short_leg['strike']} / {long_leg['strike']}).",
+                                    "spot": round(spot, 2),
+                                    "ema_50": round(ema_50, 2),
+                                    "spread_type": spread_type,
+                                    "spread_label": spread_label,
+                                    "credit_ratio_pct": round(ratio * 100.0, 2),
+                                }
+                                save_state(state)
+
+                            send_telegram(
+                                f"<b>New {spread_label} Opened</b>\n"
+                                f"Spot: <code>{spot:.2f}</code> (EMA50: <code>{ema_50:.2f}</code>)\n"
+                                f"Short: <code>{short_leg['strike']}</code> (Δ <code>{short_leg['delta']:+.3f}</code>)\n"
+                                f"Long:  <code>{long_leg['strike']}</code> (Δ <code>{long_leg['delta']:+.3f}</code>)\n"
+                                f"Actual Credit: <code>{actual_credit:.4f}</code>\n"
+                                f"Max Loss Cap: <code>{actual_max_loss:.4f}</code>"
+                            )
+                            ensure_and_update_pinned_card(force_new=False)
+
+        except Exception as e:
+            logging.error(f"Scan cycle error: {e}")
+            record_scan_diagnostics("ERROR", str(e))
+            send_telegram(f"<b>Bot Loop Error:</b> <code>{e}</code>")
+
+    with state_lock:
+        return {"ok": True, "last_scan": load_state().get("last_scan")}
+
+
+# ==========================================
 # FASTAPI WEB UI & HEALTHZ
 # ==========================================
 app = FastAPI(title="BTC Credit Spread Bot Dashboard")
@@ -1017,6 +1225,12 @@ def api_state():
     }
 
 
+@app.post("/api/scan-now")
+def api_scan_now(token: str | None = None):
+    _verify_token(token)
+    return perform_scan_cycle()
+
+
 @app.post("/api/toggle-pause")
 def api_toggle_pause(token: str | None = None):
     _verify_token(token)
@@ -1107,6 +1321,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .bar-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .4s ease; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
   button { cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px; font-weight: 600; font-size: 0.85rem; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
   .btn-primary { background: var(--blue); color: #fff; }
   .btn-warn { background: var(--amber); color: #111; }
   .btn-danger { background: var(--red); color: #fff; }
@@ -1171,6 +1386,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card">
     <div class="label">Controls</div>
     <div class="controls">
+      <button id="scanNowBtn" class="btn-primary" onclick="scanNow()">Scan Now</button>
       <button id="toggleBtn" class="btn-warn" onclick="togglePause()">Pause Bot</button>
       <button class="btn-danger" onclick="emergencyCloseAll()">Emergency /closeall</button>
       <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
@@ -1309,6 +1525,21 @@ async function fetchState() {
   }
 }
 
+async function scanNow() {
+  const btn = document.getElementById("scanNowBtn");
+  btn.disabled = true;
+  btn.textContent = "Scanning...";
+  try {
+    await fetch(apiUrl("/api/scan-now"), { method: "POST" });
+    await fetchState();
+    secLeft = 3;
+    document.getElementById("countdown").textContent = secLeft;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Scan Now";
+  }
+}
+
 async function togglePause() { await fetch(apiUrl("/api/toggle-pause"), { method: "POST" }); fetchState(); }
 async function updatePinSec() {
   const sec = parseInt(document.getElementById("pinSecInput").value, 10);
@@ -1347,11 +1578,12 @@ def start_web_ui():
 # MAIN LOOP
 # ==========================================
 def run_bot():
+    global cached_markets
     threading.Thread(target=telegram_command_worker, daemon=True).start()
     threading.Thread(target=pinned_card_worker, daemon=True).start()
     threading.Thread(target=start_web_ui, daemon=True).start()
 
-    markets = exchange.load_markets()
+    cached_markets = exchange.load_markets()
     state = load_state()
 
     send_telegram(
@@ -1364,139 +1596,7 @@ def run_bot():
     logging.info(f"Credit Spread Bot started on port {WEB_UI_PORT}.")
 
     while True:
-        try:
-            with state_lock:
-                state = load_state()
-                active_trade = state.get("active_trade")
-                paused = bool(state.get("paused", False))
-                now_ms = int(time.time() * 1000)
-
-            if active_trade:
-                hours_to_exp = (int(active_trade["expiry_ms"]) - now_ms) / (1000 * 60 * 60)
-                pnl, _ = get_unrealized_pnl(active_trade)
-
-                tp_target = float(active_trade["entry_credit"]) * TAKE_PROFIT_PCT
-                sl_limit = -float(active_trade["entry_credit"]) * STOP_LOSS_MULT
-
-                exit_reason = None
-                if pnl >= tp_target:
-                    exit_reason = "Take Profit (50% Max Credit)"
-                elif pnl <= sl_limit:
-                    exit_reason = "Stop Loss (1.5x Credit)"
-                elif hours_to_exp <= EXIT_HOURS_BEFORE_EXP:
-                    exit_reason = "Time Exit (Pre-Expiry Pin Protection)"
-
-                if exit_reason:
-                    realized = close_spread(
-                        active_trade["short_sym"],
-                        active_trade["long_sym"],
-                        active_trade["entry_credit"],
-                    )
-                    update_stats(realized)
-                    record_closed_trade(active_trade, realized, exit_reason)
-                    with state_lock:
-                        state = load_state()
-                        state["active_trade"] = None
-                        save_state(state)
-
-                    send_telegram(
-                        f"<b>Spread Closed — {exit_reason}</b>\n"
-                        f"Short: <code>{active_trade['short_sym']}</code>\n"
-                        f"Long: <code>{active_trade['long_sym']}</code>\n"
-                        f"Realized PnL: <code>{realized:+.4f}</code>"
-                    )
-                    ensure_and_update_pinned_card(force_new=False)
-                else:
-                    logging.info(
-                        f"Monitoring {active_trade['short_sym']} | "
-                        f"PnL: {pnl:+.4f} | Exp: {hours_to_exp:.1f}h"
-                    )
-
-            elif paused:
-                msg = "Bot is currently PAUSED; skipping new entries."
-                logging.info(f"[SCAN] {msg}")
-                record_scan_diagnostics("PAUSED", msg)
-
-            else:
-                spot, ema_50 = get_spot_and_ema(50)
-                spread_type = "bull_put" if spot > ema_50 else "bear_call"
-                spread_label = "Bull Put Spread" if spread_type == "bull_put" else "Bear Call Spread"
-
-                legs = find_credit_spread_legs_by_delta(markets, spot, spread_type)
-                if not legs:
-                    msg = f"No {spread_label} pair matched DTE ({MIN_DTE}-{MAX_DTE}d) & Delta targets."
-                    logging.info(f"[SCAN] Spot={spot:.2f}, EMA50={ema_50:.2f} | {msg}")
-                    record_scan_diagnostics("SKIPPED", msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label)
-                else:
-                    short_leg, long_leg, expiry_ms, width = legs
-                    quote = check_spread_edge(short_leg["symbol"], long_leg["symbol"], width)
-                    if not quote:
-                        msg = (
-                            f"Rejected {short_leg['symbol']} (Δ {short_leg['delta']:+.3f}) / "
-                            f"{long_leg['symbol']} (Δ {long_leg['delta']:+.3f}) due to bid/ask or credit < {MIN_CREDIT_RATIO*100:.0f}%."
-                        )
-                        logging.info(f"[SCAN] {msg}")
-                        record_scan_diagnostics("SKIPPED", msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label)
-                    else:
-                        ratio = quote["credit_ratio"]
-                        msg = f"Valid {spread_label} setup! Credit={quote['net_credit']:.4f} ({ratio*100:.2f}% of width)."
-                        logging.info(f"[SCAN] {msg}")
-                        record_scan_diagnostics("EXECUTING", msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label, credit_ratio=ratio)
-
-                        fills = open_spread(short_leg["symbol"], long_leg["symbol"], quote)
-                        if not fills:
-                            fail_msg = "Leg fill/chase incomplete; aborted cleanly with no open position."
-                            logging.warning(f"[SCAN] {fail_msg}")
-                            record_scan_diagnostics("SKIPPED", fail_msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label, credit_ratio=ratio)
-                        else:
-                            actual_credit = float(fills["actual_credit"])
-                            actual_max_loss = width - actual_credit
-                            new_trade = {
-                                "spread_type": spread_type,
-                                "spread_label": spread_label,
-                                "short_sym": short_leg["symbol"],
-                                "long_sym": long_leg["symbol"],
-                                "short_strike": short_leg["strike"],
-                                "long_strike": long_leg["strike"],
-                                "short_delta": short_leg["delta"],
-                                "long_delta": long_leg["delta"],
-                                "short_fill_price": fills["short_fill_price"],
-                                "long_fill_price": fills["long_fill_price"],
-                                "entry_credit": actual_credit,
-                                "max_loss": actual_max_loss,
-                                "expiry_ms": expiry_ms,
-                                "opened_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            with state_lock:
-                                state = load_state()
-                                state["active_trade"] = new_trade
-                                state["last_scan"] = {
-                                    "checked_at_ist": datetime.now(IST).strftime("%d %b %H:%M:%S IST"),
-                                    "status": "OPENED",
-                                    "reason": f"Opened {spread_label} ({short_leg['strike']} / {long_leg['strike']}).",
-                                    "spot": round(spot, 2),
-                                    "ema_50": round(ema_50, 2),
-                                    "spread_type": spread_type,
-                                    "spread_label": spread_label,
-                                    "credit_ratio_pct": round(ratio * 100.0, 2),
-                                }
-                                save_state(state)
-
-                            send_telegram(
-                                f"<b>New {spread_label} Opened</b>\n"
-                                f"Spot: <code>{spot:.2f}</code> (EMA50: <code>{ema_50:.2f}</code>)\n"
-                                f"Short: <code>{short_leg['strike']}</code> (Δ <code>{short_leg['delta']:+.3f}</code>)\n"
-                                f"Long:  <code>{long_leg['strike']}</code> (Δ <code>{long_leg['delta']:+.3f}</code>)\n"
-                                f"Actual Credit: <code>{actual_credit:.4f}</code>\n"
-                                f"Max Loss Cap: <code>{actual_max_loss:.4f}</code>"
-                            )
-                            ensure_and_update_pinned_card(force_new=False)
-
-        except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            record_scan_diagnostics("ERROR", str(e))
-            send_telegram(f"<b>Bot Loop Error:</b> <code>{e}</code>")
-
+        perform_scan_cycle(cached_markets)
         time.sleep(POLL_INTERVAL_SEC)
 
 
