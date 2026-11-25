@@ -38,7 +38,7 @@ WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("PORT") or os.getenv("WEB_UI_PORT") or "8080")
 WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "").strip()
 
-# Universe, Rotation & Concurrent Position Settings
+# Universe, Rotation, Slots & Capital Settings
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
 MAX_PAIRS_PER_CYCLE = int(os.getenv("MAX_PAIRS_PER_CYCLE", "25"))
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
@@ -52,6 +52,7 @@ raw_pinned = (
 PINNED_SYMBOLS = [s.strip() for s in raw_pinned.split(",") if s.strip()]
 
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+TOTAL_CAPITAL_USDT = float(os.getenv("TOTAL_CAPITAL_USDT", "500.0"))
 
 # Strategy Parameters (1h EMA trend + 15m ATR pullback/continuation)
 TREND_TF = "1h"
@@ -130,6 +131,8 @@ def load_state() -> dict:
             data.setdefault("pin_message_id", None)
             data.setdefault("last_scan", None)
             data.setdefault("scan_cursor", 0)
+            data.setdefault("max_open_positions", MAX_OPEN_POSITIONS)
+            data.setdefault("total_capital_usdt", TOTAL_CAPITAL_USDT)
             data.setdefault("pullback_atr_band", PULLBACK_ATR_BAND)
             data.setdefault("risk_per_trade_usdt", RISK_PER_TRADE_USDT)
             return data
@@ -142,6 +145,8 @@ def load_state() -> dict:
         "pin_message_id": None,
         "last_scan": None,
         "scan_cursor": 0,
+        "max_open_positions": MAX_OPEN_POSITIONS,
+        "total_capital_usdt": TOTAL_CAPITAL_USDT,
         "pullback_atr_band": PULLBACK_ATR_BAND,
         "risk_per_trade_usdt": RISK_PER_TRADE_USDT,
     }
@@ -151,6 +156,19 @@ def save_state(state: dict):
     state["active_trades"] = list(state.get("active_trades") or [])
     state["active_trade"] = state["active_trades"][0] if state["active_trades"] else None
     rds.set(REDIS_STATE_KEY, json.dumps(state))
+
+
+def get_runtime_capacity_params(state: dict | None = None) -> tuple[int, float]:
+    st = state if state is not None else load_state()
+    try:
+        slots = int(st.get("max_open_positions", MAX_OPEN_POSITIONS))
+    except (TypeError, ValueError):
+        slots = MAX_OPEN_POSITIONS
+    try:
+        total_cap = float(st.get("total_capital_usdt", TOTAL_CAPITAL_USDT))
+    except (TypeError, ValueError):
+        total_cap = TOTAL_CAPITAL_USDT
+    return max(1, min(20, slots)), max(10.0, min(10_000_000.0, total_cap))
 
 
 def get_runtime_strategy_params(state: dict | None = None) -> tuple[float, float]:
@@ -164,6 +182,27 @@ def get_runtime_strategy_params(state: dict | None = None) -> tuple[float, float
     except (TypeError, ValueError):
         risk = RISK_PER_TRADE_USDT
     return max(0.05, min(10.0, band)), max(1.0, min(100000.0, risk))
+
+
+def calc_capital_summary(trades: list[dict], total_capital_usdt: float) -> dict:
+    capital_used = 0.0
+    for tr in trades or []:
+        try:
+            amt = float(tr.get("amount") or 0.0)
+            csize = float(tr.get("contract_size") or 1.0)
+            entry = float(tr.get("entry_price") or 0.0)
+            capital_used += abs(amt * csize * entry)
+        except (TypeError, ValueError):
+            continue
+    total_cap = max(0.0, float(total_capital_usdt))
+    free_cap = max(0.0, total_cap - capital_used)
+    used_pct = round(min(100.0, (capital_used / total_cap) * 100.0), 1) if total_cap > 0 else 0.0
+    return {
+        "capital_used_usdt": round(capital_used, 2),
+        "total_capital_usdt": round(total_cap, 2),
+        "free_capital_usdt": round(free_cap, 2),
+        "capital_used_pct": used_pct,
+    }
 
 
 def record_scan_diagnostics(
@@ -501,12 +540,14 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     status_flag = "PAUSED" if state.get("paused") else "RUNNING"
     pin_sec = int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC))
+    active_max_slots, active_total_cap = get_runtime_capacity_params(state)
     band, risk_usdt = get_runtime_strategy_params(state)
     trades = state.get("active_trades") or []
+    cap_info = calc_capital_summary(trades, active_total_cap)
     last_scan = state.get("last_scan")
 
     if trades:
-        lines = [f"<b>Active Positions ({len(trades)}/{MAX_OPEN_POSITIONS}):</b>"]
+        lines = [f"<b>Active Positions ({len(trades)}/{active_max_slots}):</b>"]
         total_u_pnl = 0.0
         for tr in trades:
             sym = tr["symbol"]
@@ -526,7 +567,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
         position_block = "\n".join(lines)
     else:
         scan_note = f"\n<i>Last Scan: {last_scan.get('reason')}</i>" if last_scan else ""
-        position_block = f"<b>Active Positions:</b> 0/{MAX_OPEN_POSITIONS} (Flat / Scanning){scan_note}"
+        position_block = f"<b>Active Positions:</b> 0/{active_max_slots} (Flat / Scanning){scan_note}"
 
     total = int(stats.get("total_trades", 0))
     wins = int(stats.get("wins", 0))
@@ -537,6 +578,8 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     return (
         f"<b>ATR Top-{TOP_N_COINS} [{mode_label()}] [{status_flag}]</b>\n"
         f"{position_block}\n\n"
+        f"<b>Capital:</b> <code>{cap_info['capital_used_usdt']:.2f}</code> / "
+        f"<code>{cap_info['total_capital_usdt']:.2f} USDT</code> ({cap_info['capital_used_pct']}%)\n"
         f"<b>Realized Stats:</b> {wins}W / {losses}L ({win_rate:.1f}%) | "
         f"PnL: <code>{realized:+.4f}</code>\n"
         f"<b>Params:</b> Band <code>{band}</code> · Risk <code>{risk_usdt:.2f} USDT</code>\n"
@@ -718,9 +761,11 @@ def telegram_command_worker():
                     send_telegram(build_pinned_status_text(state, stats))
 
                 elif cmd == "/scannow":
+                    with state_lock:
+                        cur_slots, _ = get_runtime_capacity_params(load_state())
                     send_telegram(
                         f"<b>Scanning Top {TOP_N_COINS} slice ({MAX_PAIRS_PER_CYCLE}/cycle)...</b> "
-                        f"(Max concurrent: <code>{MAX_OPEN_POSITIONS}</code>)"
+                        f"(Open slots: <code>{cur_slots}</code>)"
                     )
                     res = perform_scan_cycle()
                     scan = (res or {}).get("last_scan") or {}
@@ -734,6 +779,19 @@ def telegram_command_worker():
                         f"Summary: {scan.get('reason', '--')}{pairs_txt}\n"
                         f"<i>{scan.get('checked_at_ist', '--')}</i>"
                     )
+
+                elif cmd == "/setslots":
+                    parts = text.split()
+                    if len(parts) < 2 or not parts[1].isdigit():
+                        send_telegram("Usage: <code>/setslots &lt;1-20&gt;</code>")
+                    else:
+                        new_slots = max(1, min(20, int(parts[1])))
+                        with state_lock:
+                            state = load_state()
+                            state["max_open_positions"] = new_slots
+                            save_state(state)
+                        send_telegram(f"Open slots updated to <b>{new_slots}</b>.")
+                        ensure_and_update_pinned_card(force_new=False)
 
                 elif cmd == "/resetstats":
                     reset_trade_stats_and_history()
@@ -804,6 +862,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                 state = load_state()
                 trades = list(state.get("active_trades") or [])
                 paused = bool(state.get("paused", False))
+                active_max_slots, _ = get_runtime_capacity_params(state)
                 pullback_band, risk_usdt = get_runtime_strategy_params(state)
 
             updated_trades: list[dict] = []
@@ -868,11 +927,11 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
             open_syms = {t["symbol"] for t in updated_trades}
 
             if paused:
-                msg = f"Bot is PAUSED ({open_count}/{MAX_OPEN_POSITIONS} open). Skipping new entries."
+                msg = f"Bot is PAUSED ({open_count}/{active_max_slots} open). Skipping new entries."
                 logging.info(f"[SCAN] {msg}")
                 record_scan_diagnostics("PAUSED", msg)
-            elif open_count >= MAX_OPEN_POSITIONS:
-                msg = f"Max concurrent positions reached ({open_count}/{MAX_OPEN_POSITIONS}). Monitoring active trades."
+            elif open_count >= active_max_slots:
+                msg = f"Max open slots reached ({open_count}/{active_max_slots}). Monitoring active trades."
                 logging.info(f"[SCAN] {msg}")
                 record_scan_diagnostics("MAX_POSITIONS", msg)
             else:
@@ -889,7 +948,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                 for sym in scan_symbols:
                     if sym in open_syms:
                         continue
-                    if len(open_syms) >= MAX_OPEN_POSITIONS:
+                    if len(open_syms) >= active_max_slots:
                         break
 
                     mkt = active_markets.get(sym)
@@ -982,7 +1041,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                     })
 
                     send_telegram(
-                        f"<b>New {setup_side.upper()} Opened [{mode_label()}] ({len(open_syms)}/{MAX_OPEN_POSITIONS})</b>\n"
+                        f"<b>New {setup_side.upper()} Opened [{mode_label()}] ({len(open_syms)}/{active_max_slots})</b>\n"
                         f"Pair: <code>{sym}</code> | Qty: <code>{amt}</code>\n"
                         f"Entry: <code>{_fmt_px(entry_px)}</code> | Stop: <code>{_fmt_px(stop_px)}</code> | "
                         f"TP: <code>{_fmt_px(tp_px)}</code>\n"
@@ -992,7 +1051,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
 
                     record_scan_diagnostics(
                         "OPENED",
-                        f"Opened {setup_side.upper()} on {sym} ({len(open_syms)}/{MAX_OPEN_POSITIONS} active).",
+                        f"Opened {setup_side.upper()} on {sym} ({len(open_syms)}/{active_max_slots} active).",
                         symbol=sym,
                         spot=spot,
                         ema_50=ema_50,
@@ -1004,7 +1063,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                 if not opened_new:
                     summary_line = (
                         f"Rotated {checked_count} pairs (cursor->{next_cursor}/{rotatable_total} of Top {TOP_N_COINS}, "
-                        f"{len(open_syms)}/{MAX_OPEN_POSITIONS} open) — no entry triggers."
+                        f"{len(open_syms)}/{active_max_slots} slots) — no entry triggers."
                     )
                     logging.info(f"[SCAN] {summary_line}")
                     record_scan_diagnostics("SKIPPED", summary_line, pair_summaries=pair_summaries[:12])
@@ -1037,6 +1096,11 @@ class StrategyConfigPayload(BaseModel):
     risk_per_trade_usdt: float
 
 
+class CapacityConfigPayload(BaseModel):
+    max_open_positions: int
+    total_capital_usdt: float
+
+
 def _verify_token(token: str | None):
     if WEB_UI_TOKEN and token != WEB_UI_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid dashboard token")
@@ -1064,8 +1128,11 @@ def healthz():
     with state_lock:
         st = load_state()
         paused = bool(st.get("paused", False))
-        active_cnt = len(st.get("active_trades") or [])
+        trades = st.get("active_trades") or []
+        active_cnt = len(trades)
+        active_max_slots, active_total_cap = get_runtime_capacity_params(st)
         band, risk_usdt = get_runtime_strategy_params(st)
+        cap_info = calc_capital_summary(trades, active_total_cap)
     return {
         "status": "ok" if redis_ok else "degraded",
         "redis": redis_ok,
@@ -1074,8 +1141,9 @@ def healthz():
         "port": WEB_UI_PORT,
         "top_n_coins": TOP_N_COINS,
         "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
-        "max_open_positions": MAX_OPEN_POSITIONS,
+        "max_open_positions": active_max_slots,
         "active_positions_count": active_cnt,
+        **cap_info,
         "pullback_atr_band": band,
         "risk_per_trade_usdt": risk_usdt,
         "paused": paused,
@@ -1089,10 +1157,12 @@ def api_state():
         state = load_state()
         stats = load_stats()
         history_raw = load_trade_history(limit=25)
+        active_max_slots, active_total_cap = get_runtime_capacity_params(state)
         active_band, active_risk = get_runtime_strategy_params(state)
 
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     trades = state.get("active_trades") or []
+    cap_info = calc_capital_summary(trades, active_total_cap)
     live_trades = []
     total_unrealized = 0.0
     has_any_pnl = False
@@ -1136,7 +1206,8 @@ def api_state():
         "top_n_coins": TOP_N_COINS,
         "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
         "pinned_symbols": PINNED_SYMBOLS,
-        "max_open_positions": MAX_OPEN_POSITIONS,
+        "max_open_positions": active_max_slots,
+        **cap_info,
         "pullback_atr_band": active_band,
         "risk_per_trade_usdt": active_risk,
         "paused": bool(state.get("paused", False)),
@@ -1153,6 +1224,30 @@ def api_state():
 def api_scan_now(token: str | None = None):
     _verify_token(token)
     return perform_scan_cycle()
+
+
+@app.post("/api/capacity-config")
+def api_capacity_config(payload: CapacityConfigPayload, token: str | None = None):
+    _verify_token(token)
+    if payload.max_open_positions < 1 or payload.max_open_positions > 20:
+        raise HTTPException(status_code=400, detail="max_open_positions must be between 1 and 20")
+    if payload.total_capital_usdt < 10.0 or payload.total_capital_usdt > 10_000_000.0:
+        raise HTTPException(status_code=400, detail="total_capital_usdt must be between 10 and 10,000,000")
+
+    with state_lock:
+        state = load_state()
+        state["max_open_positions"] = int(payload.max_open_positions)
+        state["total_capital_usdt"] = round(float(payload.total_capital_usdt), 2)
+        save_state(state)
+        slots, cap = get_runtime_capacity_params(state)
+
+    send_telegram(
+        f"<b>Web UI Capacity Updated:</b>\n"
+        f"Open Slots: <code>{slots}</code>\n"
+        f"Total Capital: <code>{cap:.2f} USDT</code>"
+    )
+    ensure_and_update_pinned_card(force_new=False)
+    return {"ok": True, "max_open_positions": slots, "total_capital_usdt": cap}
 
 
 @app.post("/api/strategy-config")
@@ -1264,10 +1359,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-pause { background: rgba(245,158,11,.15); color: var(--amber); border: 1px solid rgba(245,158,11,.4); }
   .badge-mode { background: rgba(59,130,246,.15); color: var(--blue); border: 1px solid rgba(59,130,246,.4); }
   .meta { font-size: 0.85rem; color: var(--muted); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 12px; margin-bottom: 16px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
   .label { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-  .val { font-size: 1.4rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .val { font-size: 1.35rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .sub-meta { margin-top: 4px; font-size: 0.78rem; color: var(--muted); }
   .pos { color: var(--green); } .neg { color: var(--red); }
   .scan-reason { margin-top: 8px; font-size: 0.9rem; color: var(--amber); }
   .pair-list { margin-top: 10px; display: grid; gap: 8px; font-size: 0.84rem; color: var(--muted); }
@@ -1301,7 +1397,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .param-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--muted); }
   .param-field input {
     background: #0f1520; border: 1px solid var(--border); color: var(--text);
-    padding: 8px 10px; border-radius: 8px; width: 140px; font-size: 0.85rem;
+    padding: 8px 10px; border-radius: 8px; width: 145px; font-size: 0.85rem;
   }
   .cmd-feedback { margin-top: 10px; font-size: 0.83rem; color: var(--muted); min-height: 18px; }
   button { cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px; font-weight: 600; font-size: 0.85rem; }
@@ -1334,6 +1430,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card"><div class="label">Realized PnL (USDT)</div><div id="realizedPnl" class="val">--</div></div>
     <div class="card"><div class="label">Win / Loss Record</div><div id="winLoss" class="val">0W / 0L</div></div>
     <div class="card"><div class="label">Open Slots</div><div id="slotsVal" class="val">0 / 2</div></div>
+    <div class="card">
+      <div class="label">Capital Used / Total</div>
+      <div id="capitalVal" class="val">0.00 / 500.00</div>
+      <div id="capitalSub" class="sub-meta">0.0% used · Free: 500.00 USDT</div>
+    </div>
   </div>
 
   <div class="card" style="margin-bottom:16px;">
@@ -1383,6 +1484,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button type="button" class="btn-primary" onclick="updatePinSec()">Set</button>
       </div>
     </div>
+
+    <form id="capacityForm" class="param-form" onsubmit="saveCapacityConfig(event)">
+      <div class="param-field">
+        <label for="maxSlotsInput">OPEN_SLOTS (1–20)</label>
+        <input id="maxSlotsInput" type="number" step="1" min="1" max="20" value="2" required />
+      </div>
+      <div class="param-field">
+        <label for="totalCapInput">TOTAL_CAPITAL_USDT</label>
+        <input id="totalCapInput" type="number" step="10" min="10" max="10000000" value="500" required />
+      </div>
+      <button id="saveCapBtn" type="submit" class="btn-primary">Update Slots &amp; Capital</button>
+    </form>
 
     <form id="strategyForm" class="param-form" onsubmit="saveStrategyConfig(event)">
       <div class="param-field">
@@ -1488,6 +1601,22 @@ async function fetchState() {
     const maxPos = data.max_open_positions || 2;
     document.getElementById("slotsVal").textContent = `${activeTrades.length} / ${maxPos}`;
 
+    const usedCap = Number(data.capital_used_usdt || 0);
+    const totCap = Number(data.total_capital_usdt || 500);
+    const freeCap = Number(data.free_capital_usdt ?? Math.max(0, totCap - usedCap));
+    const usedPct = Number(data.capital_used_pct || 0);
+    document.getElementById("capitalVal").textContent = `${usedCap.toFixed(2)} / ${totCap.toFixed(2)}`;
+    document.getElementById("capitalSub").textContent = `${usedPct.toFixed(1)}% used · Free: ${freeCap.toFixed(2)} USDT`;
+
+    const slotsEl = document.getElementById("maxSlotsInput");
+    const capEl = document.getElementById("totalCapInput");
+    if (slotsEl && document.activeElement !== slotsEl && data.max_open_positions !== undefined) {
+      slotsEl.value = data.max_open_positions;
+    }
+    if (capEl && document.activeElement !== capEl && data.total_capital_usdt !== undefined) {
+      capEl.value = data.total_capital_usdt;
+    }
+
     const bandEl = document.getElementById("pullbackBandInput");
     const riskEl = document.getElementById("riskUsdtInput");
     if (bandEl && document.activeElement !== bandEl && data.pullback_atr_band !== undefined) {
@@ -1592,6 +1721,36 @@ async function fetchState() {
     }
   } catch (err) {
     console.error("State fetch error:", err);
+  }
+}
+
+async function saveCapacityConfig(e) {
+  e.preventDefault();
+  const btn = document.getElementById("saveCapBtn");
+  const slots = parseInt(document.getElementById("maxSlotsInput").value, 10);
+  const cap = parseFloat(document.getElementById("totalCapInput").value);
+  if (Number.isNaN(slots) || slots < 1 || slots > 20 || Number.isNaN(cap) || cap < 10) {
+    setCmdFeedback("Enter valid slots (1–20) and total capital (>= 10 USDT).", true);
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "Updating...";
+  try {
+    const res = await fetch(apiUrl("/api/capacity-config"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_open_positions: slots, total_capital_usdt: cap }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setCmdFeedback(out.detail || "Failed to update slots & capital.", true);
+      return;
+    }
+    setCmdFeedback(`Updated: OPEN_SLOTS=${out.max_open_positions}, TOTAL_CAPITAL_USDT=${Number(out.total_capital_usdt).toFixed(2)}`);
+    await fetchState();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Update Slots & Capital";
   }
 }
 
@@ -1729,10 +1888,11 @@ def run_bot():
     cached_markets = exchange.load_markets()
     get_top_gate_perp_symbols(cached_markets, force_refresh=True)
     state = load_state()
+    init_slots, init_cap = get_runtime_capacity_params(state)
 
     send_telegram(
         f"<b>ATR Top-{TOP_N_COINS} Bot Started [{mode_label()}]</b>\n"
-        f"Max Positions: <code>{MAX_OPEN_POSITIONS}</code> | Slice: <code>{MAX_PAIRS_PER_CYCLE}/cycle</code>\n"
+        f"Open Slots: <code>{init_slots}</code> | Capital: <code>{init_cap:.2f} USDT</code> | Slice: <code>{MAX_PAIRS_PER_CYCLE}/cycle</code>\n"
         f"Risk/Trade: <code>{RISK_PER_TRADE_USDT:.2f} USDT</code> | Port: <code>{WEB_UI_PORT}</code>"
     )
     ensure_and_update_pinned_card(force_new=False)
