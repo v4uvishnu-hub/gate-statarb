@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,7 +103,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
 
 CANDLE_INTERVAL = os.getenv("CANDLE_INTERVAL", "5m")
 SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 60))
-TG_PIN_REFRESH_SEC = max(20, env_int("TG_PIN_REFRESH_SEC", 60))
+TG_PIN_REFRESH_SEC = max(3, env_int("TG_PIN_REFRESH_SEC", 5))
 INITIAL_EQUITY = max(50.0, env_float("INITIAL_EQUITY", 1000.0))
 TAKER_FEE = max(0.0, env_float("TAKER_FEE", 0.0005))
 FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 8)))
@@ -129,6 +130,30 @@ def ist_day_str(ts_ms: Optional[int] = None) -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def parse_retry_after_sec(status: int, body: str) -> Optional[float]:
+    retry_sec: Optional[float] = None
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            params = parsed.get("parameters") or {}
+            if isinstance(params, dict) and params.get("retry_after") is not None:
+                retry_sec = float(params["retry_after"])
+    except Exception:
+        pass
+
+    if retry_sec is None:
+        m = re.search(r"retry after\s+(\d+)", body, re.IGNORECASE)
+        if m:
+            retry_sec = float(m.group(1))
+
+    if status == 429 and (retry_sec is None or retry_sec <= 0):
+        retry_sec = 15.0
+    elif retry_sec is not None and retry_sec <= 0:
+        retry_sec = 10.0
+
+    return min(300.0, retry_sec) if retry_sec is not None else None
 
 
 class StateStore:
@@ -533,6 +558,7 @@ class StatArbBot:
         self.session = session
         self.tg_offset = 0
         self._last_pin_text: Optional[str] = None
+        self._pin_backoff_until: float = 0.0
 
     async def send_telegram(
         self,
@@ -567,7 +593,7 @@ class StatArbBot:
                 body = await resp.text()
                 if resp.status != 200:
                     log.warning("Telegram sendMessage failed (%s): %s", resp.status, body[:250])
-                    if parse_mode is not None:
+                    if parse_mode is not None and resp.status != 429:
                         return await self.send_telegram(
                             text,
                             chat_id=target,
@@ -708,9 +734,19 @@ class StatArbBot:
         except Exception as exc:
             log.warning("unpinChatMessage error: %r", exc)
 
-    async def sync_pinned_dashboard(self, force_new: bool = False, chat_override: Optional[str] = None) -> str:
+    async def sync_pinned_dashboard(
+        self,
+        force_new: bool = False,
+        chat_override: Optional[str] = None,
+        respect_backoff: bool = False,
+    ) -> str:
         if not TELEGRAM_BOT_TOKEN:
             return "TELEGRAM_BOT_TOKEN is not configured."
+
+        now_sec = time.monotonic()
+        if respect_backoff and not force_new and now_sec < self._pin_backoff_until:
+            rem = max(1, int(math.ceil(self._pin_backoff_until - now_sec)))
+            return f"Pinned refresh backed off for {rem}s due to Telegram rate limit."
 
         card_text = await self._build_pinned_card_html()
         async with self.store.lock:
@@ -741,6 +777,12 @@ class StatArbBot:
                     if "message is not modified" in body.lower():
                         self._last_pin_text = card_text
                         return f"Pinned card is already current (#{msg_id})."
+                    retry_sec = parse_retry_after_sec(resp.status, body)
+                    if resp.status == 429 or retry_sec is not None:
+                        wait_sec = retry_sec or 15.0
+                        self._pin_backoff_until = time.monotonic() + wait_sec
+                        log.warning("Telegram pin rate-limited (429); backing off %.0fs", wait_sec)
+                        return f"Rate-limited by Telegram; backing off {int(wait_sec)}s."
                     log.warning("editMessageText failed (%s): %s; creating fresh pinned card", resp.status, body[:200])
             except Exception as exc:
                 log.warning("editMessageText error: %r; creating fresh pinned card", exc)
@@ -756,6 +798,7 @@ class StatArbBot:
 
         await self.pin_chat_message(str(target_chat), int(new_msg_id))
         self._last_pin_text = card_text
+        self._pin_backoff_until = 0.0
         async with self.store.lock:
             self.store.state["pinned_chat_id"] = str(target_chat)
             self.store.state["pinned_message_id"] = int(new_msg_id)
@@ -766,11 +809,15 @@ class StatArbBot:
     async def pinned_dashboard_loop(self) -> None:
         while True:
             try:
-                await asyncio.sleep(TG_PIN_REFRESH_SEC)
+                now_sec = time.monotonic()
+                sleep_sec = float(TG_PIN_REFRESH_SEC)
+                if now_sec < self._pin_backoff_until:
+                    sleep_sec = max(sleep_sec, self._pin_backoff_until - now_sec)
+                await asyncio.sleep(sleep_sec)
                 async with self.store.lock:
                     has_pin = bool(self.store.state.get("pinned_message_id"))
                 if has_pin:
-                    await self.sync_pinned_dashboard(force_new=False)
+                    await self.sync_pinned_dashboard(force_new=False, respect_backoff=True)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -1210,7 +1257,9 @@ class StatArbBot:
                 await self.answer_callback_query(cb_id, "Unauthorized")
                 return
             if cb_data == "pin_refresh":
-                status_msg = await self.sync_pinned_dashboard(force_new=False, chat_override=cb_chat)
+                status_msg = await self.sync_pinned_dashboard(
+                    force_new=False, chat_override=cb_chat, respect_backoff=False
+                )
                 await self.answer_callback_query(cb_id, status_msg)
             else:
                 await self.answer_callback_query(cb_id, "Done")
@@ -1234,7 +1283,9 @@ class StatArbBot:
             return
 
         if cmd == "/pin":
-            status_msg = await self.sync_pinned_dashboard(force_new=True, chat_override=chat_id)
+            status_msg = await self.sync_pinned_dashboard(
+                force_new=True, chat_override=chat_id, respect_backoff=False
+            )
             await self.send_telegram(f"📌 {html.escape(status_msg)}", chat_id)
             return
 
@@ -1245,6 +1296,7 @@ class StatArbBot:
                 self.store.state["pinned_message_id"] = None
                 self.store.add_event("TELEGRAM", "Unpinned live status card")
                 await self.store.save()
+            self._pin_backoff_until = 0.0
             await self.unpin_chat_message(str(p_chat), int(p_msg) if p_msg else None)
             await self.send_telegram("📌 Unpinned live status card.", chat_id)
             return
@@ -1691,7 +1743,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="right-controls">
       <div class="badge" id="istClock">--:--:-- IST</div>
-      <div class="badge" id="countdownBadge">Refresh in: 3s</div>
+      <div class="badge" id="countdownBadge">Refresh in: 5s</div>
       <button class="btn-pause" id="btnTogglePause" onclick="togglePause()">Pause</button>
       <button class="btn-close" onclick="closeAll()">Close All</button>
     </div>
@@ -1758,7 +1810,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 let latestState = null;
-let countdownSec = 3;
+let countdownSec = 5;
 let isFetchingState = false;
 
 function fmtIST(ts) {
@@ -1911,11 +1963,11 @@ function renderState(s) {
 
 async function fetchState() {
   if (isFetchingState) {
-    countdownSec = 3;
+    countdownSec = 5;
     return;
   }
   isFetchingState = true;
-  countdownSec = 3;
+  countdownSec = 5;
   const controller = new AbortController();
   const timerId = setTimeout(() => controller.abort(), 2500);
   try {
@@ -1930,7 +1982,7 @@ async function fetchState() {
   } catch (e) {} finally {
     clearTimeout(timerId);
     isFetchingState = false;
-    countdownSec = 3;
+    countdownSec = 5;
     tickClockAndBars();
   }
 }
