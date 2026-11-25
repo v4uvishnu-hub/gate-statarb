@@ -47,6 +47,7 @@ HELP_TEXT_HTML = (
     "/setalerts - Mute or unmute trade alerts (on or off)\n"
     "/setdryrun - Toggle paper (true) or live (false confirm)\n"
     "/setdailyloss - Set max daily loss USDT guard (0 = off)\n"
+    "/setpinsec - Set synced Web UI &amp; pin refresh sec (3-3600)\n"
     "/settopn - Set TOP_N_COINS universe size (10-200)\n"
     "/setlookback - Set LOOKBACK candle window (30-300)\n"
     "/setmaxpos - Set MAX_POSITIONS slot cap (1-10)\n"
@@ -89,6 +90,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
     return {
         "DRY_RUN": env_bool("DRY_RUN", True),
         "TRADE_ALERTS": env_bool("TRADE_ALERTS", True),
+        "TG_PIN_REFRESH_SEC": max(3, min(3600, env_int("TG_PIN_REFRESH_SEC", 60))),
         "MAX_DAILY_LOSS_USDT": max(0.0, min(100000.0, env_float("MAX_DAILY_LOSS_USDT", 50.0))),
         "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 25))),
         "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 60))),
@@ -103,7 +105,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
 
 CANDLE_INTERVAL = os.getenv("CANDLE_INTERVAL", "5m")
 SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 60))
-TG_PIN_REFRESH_SEC = max(3, env_int("TG_PIN_REFRESH_SEC", 5))
+TG_PIN_REFRESH_SEC = max(3, min(3600, env_int("TG_PIN_REFRESH_SEC", 60)))
 INITIAL_EQUITY = max(50.0, env_float("INITIAL_EQUITY", 1000.0))
 TAKER_FEE = max(0.0, env_float("TAKER_FEE", 0.0005))
 FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 8)))
@@ -560,6 +562,13 @@ class StatArbBot:
         self._last_pin_text: Optional[str] = None
         self._pin_backoff_until: float = 0.0
 
+    def get_pin_refresh_sec(self) -> int:
+        raw = self.store.state.get("config", {}).get("TG_PIN_REFRESH_SEC", TG_PIN_REFRESH_SEC)
+        try:
+            return max(3, min(3600, int(float(raw))))
+        except (ValueError, TypeError):
+            return TG_PIN_REFRESH_SEC
+
     async def send_telegram(
         self,
         text: str,
@@ -654,6 +663,7 @@ class StatArbBot:
             self.store.roll_daily_pnl_if_needed()
             state = self.store.state
             cfg = state.get("config", {})
+            pin_sec = self.get_pin_refresh_sec()
             positions = state.get("positions", [])
             ranked = state.get("ranked_pairs", [])
             u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in positions)
@@ -691,7 +701,7 @@ class StatArbBot:
             )
 
         lines.append(f"<b>Last Tick:</b> {html.escape(last_tick)}")
-        lines.append(f"<b>Updated:</b> {html.escape(fmt_ist(now_ms()))} (every {TG_PIN_REFRESH_SEC}s)")
+        lines.append(f"<b>Updated:</b> {html.escape(fmt_ist(now_ms()))} (every {pin_sec}s)")
         return "\n".join(lines)
 
     async def pin_chat_message(self, chat_id: str, message_id: int) -> None:
@@ -752,6 +762,7 @@ class StatArbBot:
         async with self.store.lock:
             target_chat = chat_override or self.store.state.get("pinned_chat_id") or TELEGRAM_ADMIN_ID
             msg_id = self.store.state.get("pinned_message_id")
+            pin_sec = self.get_pin_refresh_sec()
 
         if not target_chat:
             return "TELEGRAM_ADMIN_ID is not configured."
@@ -804,18 +815,19 @@ class StatArbBot:
             self.store.state["pinned_message_id"] = int(new_msg_id)
             self.store.add_event("TELEGRAM", f"Pinned live status card (#{new_msg_id})")
             await self.store.save()
-        return f"Pinned live status card (#{new_msg_id}) — auto-refreshes every {TG_PIN_REFRESH_SEC}s."
+        return f"Pinned live status card (#{new_msg_id}) — auto-refreshes every {pin_sec}s."
 
     async def pinned_dashboard_loop(self) -> None:
         while True:
             try:
+                async with self.store.lock:
+                    pin_sec = float(self.get_pin_refresh_sec())
+                    has_pin = bool(self.store.state.get("pinned_message_id"))
                 now_sec = time.monotonic()
-                sleep_sec = float(TG_PIN_REFRESH_SEC)
+                sleep_sec = pin_sec
                 if now_sec < self._pin_backoff_until:
                     sleep_sec = max(sleep_sec, self._pin_backoff_until - now_sec)
                 await asyncio.sleep(sleep_sec)
-                async with self.store.lock:
-                    has_pin = bool(self.store.state.get("pinned_message_id"))
                 if has_pin:
                     await self.sync_pinned_dashboard(force_new=False, respect_backoff=True)
             except asyncio.CancelledError:
@@ -1353,9 +1365,11 @@ class StatArbBot:
                 mode = "PAPER (DRY_RUN)" if cfg["DRY_RUN"] else "LIVE TRADING"
                 alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
                 d_pnl = float(state.get("daily_realized_pnl", 0.0))
+                pin_sec = self.get_pin_refresh_sec()
                 reply = (
                     f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b> | Alerts: <code>{alerts_state}</code>\n"
                     f"<b>Positions:</b> <code>{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}</code> | "
+                    f"<b>Sync Refresh:</b> <code>{pin_sec}s</code> | "
                     f"<b>Z Entry/Exit/Stop:</b> <code>{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}</code>\n"
                     f"<b>Daily Realized:</b> <code>{d_pnl:+.5f} USDT</code> (Cap: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code>) | "
                     f"<b>Open PnL:</b> <code>{u_pnl:+.5f} USDT</code>\n"
@@ -1397,6 +1411,7 @@ class StatArbBot:
                 for key in [
                     "DRY_RUN",
                     "TRADE_ALERTS",
+                    "TG_PIN_REFRESH_SEC",
                     "MAX_DAILY_LOSS_USDT",
                     "TOP_N_COINS",
                     "LOOKBACK",
@@ -1413,6 +1428,7 @@ class StatArbBot:
 
             elif cmd == "/resetconfig":
                 state["config"] = get_env_config_defaults()
+                self._pin_backoff_until = 0.0
                 self.store.add_event("CONFIG", "All runtime parameters reset to defaults via Telegram")
                 await self.store.save()
                 reply = "✅ All parameters reset to built-in defaults."
@@ -1450,6 +1466,26 @@ class StatArbBot:
                         reply = "🔇 Trade alerts set to <b>OFF</b> (bot keeps running; direct commands still reply)."
                     else:
                         reply = "Send <code>/setalerts on</code> or <code>/setalerts off</code>."
+
+            elif cmd == "/setpinsec":
+                cur_sec = self.get_pin_refresh_sec()
+                if not arg1:
+                    reply = (
+                        f"Current <code>TG_PIN_REFRESH_SEC</code>: <code>{cur_sec}</code>s (synced with Web UI &amp; pinned card, range 3–3600). "
+                        f"Example: <code>/setpinsec 60</code>"
+                    )
+                else:
+                    try:
+                        val = int(arg1)
+                        if not (3 <= val <= 3600):
+                            raise ValueError
+                        cfg["TG_PIN_REFRESH_SEC"] = val
+                        self._pin_backoff_until = 0.0
+                        self.store.add_event("CONFIG", f"TG_PIN_REFRESH_SEC updated to {val}s (Web UI & pin synced)")
+                        await self.store.save()
+                        reply = f"✅ Synced refresh interval (<code>TG_PIN_REFRESH_SEC</code> &amp; Web UI) set to <code>{val}</code>s."
+                    except ValueError:
+                        reply = f"Enter whole seconds from 3 to 3600 (current: <code>{cur_sec}</code>s). Example: <code>/setpinsec 60</code>"
 
             elif cmd == "/setdryrun":
                 if not arg1:
@@ -1743,7 +1779,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="right-controls">
       <div class="badge" id="istClock">--:--:-- IST</div>
-      <div class="badge" id="countdownBadge">Refresh in: 5s</div>
+      <div class="badge" id="countdownBadge">Refresh in: 60s</div>
       <button class="btn-pause" id="btnTogglePause" onclick="togglePause()">Pause</button>
       <button class="btn-close" onclick="closeAll()">Close All</button>
     </div>
@@ -1810,7 +1846,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 let latestState = null;
-let countdownSec = 5;
+let refreshIntervalSec = 60;
+let countdownSec = 60;
 let isFetchingState = false;
 
 function fmtIST(ts) {
@@ -1825,6 +1862,12 @@ function fmtIST(ts) {
 
 function esc(v) {
   return String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function getSyncedIntervalSec(s) {
+  const raw = Number(s?.config?.TG_PIN_REFRESH_SEC);
+  if (!Number.isFinite(raw) || raw < 3) return 60;
+  return Math.min(3600, Math.round(raw));
 }
 
 function tickClockAndBars() {
@@ -1851,7 +1894,13 @@ function tickClockAndBars() {
 }
 
 function renderState(s) {
+  const prevInterval = refreshIntervalSec;
   latestState = s;
+  refreshIntervalSec = getSyncedIntervalSec(s);
+  if (prevInterval !== refreshIntervalSec && countdownSec > refreshIntervalSec) {
+    countdownSec = refreshIntervalSec;
+  }
+
   const cfg = s.config || {};
   const errEl = document.getElementById("errBanner");
   if (s.last_error) {
@@ -1864,6 +1913,7 @@ function renderState(s) {
   document.getElementById("modeLine").textContent =
     (s.paused ? "PAUSED" : "RUNNING") +
     " | Mode: " + (cfg.DRY_RUN ? "PAPER" : "LIVE") +
+    " | Sync: " + refreshIntervalSec + "s" +
     " | Top-" + (cfg.TOP_N_COINS || 25) +
     " | Lookback: " + (cfg.LOOKBACK || 60) +
     " | Z (In/Out/Stop): " + cfg.Z_ENTRY + "/" + cfg.Z_EXIT + "/" + cfg.Z_STOP +
@@ -1963,11 +2013,11 @@ function renderState(s) {
 
 async function fetchState() {
   if (isFetchingState) {
-    countdownSec = 5;
+    countdownSec = refreshIntervalSec;
     return;
   }
   isFetchingState = true;
-  countdownSec = 5;
+  countdownSec = refreshIntervalSec;
   const controller = new AbortController();
   const timerId = setTimeout(() => controller.abort(), 2500);
   try {
@@ -1982,7 +2032,7 @@ async function fetchState() {
   } catch (e) {} finally {
     clearTimeout(timerId);
     isFetchingState = false;
-    countdownSec = 5;
+    countdownSec = refreshIntervalSec;
     tickClockAndBars();
   }
 }
