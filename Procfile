@@ -1,1 +1,1 @@
-web: python main.py
+web: python credit_spread_bot.py
