@@ -89,8 +89,8 @@ def get_env_config_defaults() -> Dict[str, Any]:
         "DRY_RUN": env_bool("DRY_RUN", True),
         "TRADE_ALERTS": env_bool("TRADE_ALERTS", True),
         "MAX_DAILY_LOSS_USDT": max(0.0, min(100000.0, env_float("MAX_DAILY_LOSS_USDT", 50.0))),
-        "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 100))),
-        "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 100))),
+        "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 35))),
+        "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 80))),
         "MAX_POSITIONS": max(1, min(10, env_int("MAX_POSITIONS", 3))),
         "MAX_HOLD_MINUTES": max(15, min(4320, env_int("MAX_HOLD_MINUTES", 720))),
         "NOTIONAL_USDT": max(10.0, min(10000.0, env_float("NOTIONAL_USDT", 100.0))),
@@ -101,12 +101,12 @@ def get_env_config_defaults() -> Dict[str, Any]:
 
 
 CANDLE_INTERVAL = os.getenv("CANDLE_INTERVAL", "5m")
-SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 45))
+SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 60))
 TG_PIN_REFRESH_SEC = max(20, env_int("TG_PIN_REFRESH_SEC", 60))
 INITIAL_EQUITY = max(50.0, env_float("INITIAL_EQUITY", 1000.0))
 TAKER_FEE = max(0.0, env_float("TAKER_FEE", 0.0005))
-FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 15)))
-CANDIDATE_POOL_LIMIT = max(20, min(80, env_int("CANDIDATE_POOL_LIMIT", 45)))
+FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 12)))
+CANDIDATE_POOL_LIMIT = max(10, min(80, env_int("CANDIDATE_POOL_LIMIT", 25)))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
@@ -136,6 +136,7 @@ class StateStore:
         self.lock = asyncio.Lock()
         self.redis_client: Optional[redis.Redis] = None
         self.state: Dict[str, Any] = self._default_state()
+        self.state_json_cache: str = json.dumps(self.state, separators=(",", ":"))
         self.candle_cache: Dict[str, List[Tuple[int, float]]] = {}
         self.contracts_meta: Dict[str, Dict[str, float]] = {}
         self.contracts_meta_ts: float = 0.0
@@ -194,7 +195,7 @@ class StateStore:
                 await self.redis_client.ping()
                 log.info("Connected to Redis for persistent state")
             except Exception as exc:
-                log.warning("Redis connection failed (%s); falling back to %s", exc, STATE_FILE)
+                log.warning("Redis connection failed (%r); falling back to %s", exc, STATE_FILE)
                 self.redis_client = None
 
         loaded: Optional[Dict[str, Any]] = None
@@ -205,7 +206,7 @@ class StateStore:
                     loaded = json.loads(raw)
                     log.info("Loaded state from Redis")
             except Exception as exc:
-                log.warning("Redis read failed: %s", exc)
+                log.warning("Redis read failed: %r", exc)
 
         if loaded is None and os.path.exists(STATE_FILE):
             try:
@@ -213,7 +214,7 @@ class StateStore:
                     loaded = json.load(f)
                 log.info("Loaded state from %s", STATE_FILE)
             except Exception as exc:
-                log.warning("Local JSON read failed: %s", exc)
+                log.warning("Local JSON read failed: %r", exc)
 
         if isinstance(loaded, dict):
             base = self._default_state()
@@ -231,6 +232,7 @@ class StateStore:
             self.state = base
 
         self.roll_daily_pnl_if_needed()
+        self.state_json_cache = json.dumps(self.state, separators=(",", ":"))
         await self.save()
 
     def add_event(self, ev_type: str, msg: str) -> None:
@@ -241,18 +243,19 @@ class StateStore:
 
     async def save(self) -> None:
         payload = json.dumps(self.state, separators=(",", ":"))
+        self.state_json_cache = payload
         if self.redis_client is not None:
             try:
                 await self.redis_client.set(REDIS_STATE_KEY, payload)
             except Exception as exc:
-                log.warning("Redis save error: %s", exc)
+                log.warning("Redis save error: %r", exc)
         try:
             tmp = f"{STATE_FILE}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(payload)
             os.replace(tmp, STATE_FILE)
         except Exception as exc:
-            log.warning("Local state save error: %s", exc)
+            log.warning("Local state save error: %r", exc)
 
     async def close(self) -> None:
         if self.redis_client is not None:
@@ -576,7 +579,7 @@ class StatArbBot:
                 data = json.loads(body)
                 return int((data.get("result") or {}).get("message_id") or 0) or None
         except Exception as exc:
-            log.warning("Telegram send error: %s", exc)
+            log.warning("Telegram send error: %r", exc)
             return None
 
     async def answer_callback_query(self, callback_query_id: str, text: str = "Refreshed") -> None:
@@ -595,7 +598,7 @@ class StatArbBot:
             ) as resp:
                 await resp.read()
         except Exception as exc:
-            log.warning("answerCallbackQuery error: %s", exc)
+            log.warning("answerCallbackQuery error: %r", exc)
 
     async def send_startup_notification(self) -> None:
         async with self.store.lock:
@@ -683,7 +686,7 @@ class StatArbBot:
                     body = await resp.text()
                     log.warning("pinChatMessage failed (%s): %s", resp.status, body[:200])
         except Exception as exc:
-            log.warning("pinChatMessage error: %s", exc)
+            log.warning("pinChatMessage error: %r", exc)
 
     async def unpin_chat_message(self, chat_id: Optional[str] = None, message_id: Optional[int] = None) -> None:
         if not TELEGRAM_BOT_TOKEN:
@@ -703,7 +706,7 @@ class StatArbBot:
             ) as resp:
                 await resp.read()
         except Exception as exc:
-            log.warning("unpinChatMessage error: %s", exc)
+            log.warning("unpinChatMessage error: %r", exc)
 
     async def sync_pinned_dashboard(self, force_new: bool = False, chat_override: Optional[str] = None) -> str:
         if not TELEGRAM_BOT_TOKEN:
@@ -740,7 +743,7 @@ class StatArbBot:
                         return f"Pinned card is already current (#{msg_id})."
                     log.warning("editMessageText failed (%s): %s; creating fresh pinned card", resp.status, body[:200])
             except Exception as exc:
-                log.warning("editMessageText error: %s; creating fresh pinned card", exc)
+                log.warning("editMessageText error: %r; creating fresh pinned card", exc)
 
         new_msg_id = await self.send_telegram(
             card_text,
@@ -771,7 +774,7 @@ class StatArbBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.warning("Pinned dashboard refresh error: %s", exc)
+                log.warning("Pinned dashboard refresh error: %r", exc)
 
     async def refresh_contracts_meta(self) -> None:
         if self.store.contracts_meta and (time.time() - self.store.contracts_meta_ts) < 6 * 3600:
@@ -805,11 +808,11 @@ class StatArbBot:
         selected = [c for c, _ in ranked[:top_n]]
 
         sem = asyncio.Semaphore(FETCH_CONCURRENCY)
-        full_limit = max(120, lookback + 25)
+        full_limit = max(90, lookback + 20)
 
         async def fetch_one(contract: str) -> None:
             prev = self.store.candle_cache.get(contract, [])
-            limit = 15 if len(prev) >= lookback else full_limit
+            limit = 12 if len(prev) >= lookback else full_limit
             async with sem:
                 raw = await self.gate.public_get(
                     "/futures/usdt/candlesticks",
@@ -821,7 +824,7 @@ class StatArbBot:
                 close = float(bar.get("c") or 0.0)
                 if ts > 0 and close > 0:
                     merged[ts] = close
-            ordered = sorted(merged.items(), key=lambda x: x[0])[-(lookback + 35) :]
+            ordered = sorted(merged.items(), key=lambda x: x[0])[-(lookback + 25) :]
             if ordered:
                 self.store.candle_cache[contract] = ordered
 
@@ -1436,7 +1439,7 @@ class StatArbBot:
 
             elif cmd == "/settopn":
                 if not arg1:
-                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–200). Example: <code>/settopn 80</code>"
+                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–200). Example: <code>/settopn 35</code>"
                 else:
                     try:
                         val = int(arg1)
@@ -1447,11 +1450,11 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>TOP_N_COINS</code> updated to <code>{val}</code>."
                     except ValueError:
-                        reply = f"Enter a whole number from 10 to 200 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 80</code>"
+                        reply = f"Enter a whole number from 10 to 200 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 35</code>"
 
             elif cmd == "/setlookback":
                 if not arg1:
-                    reply = f"Current <code>LOOKBACK</code>: <code>{cfg['LOOKBACK']}</code> bars (range 30–300). Example: <code>/setlookback 120</code>"
+                    reply = f"Current <code>LOOKBACK</code>: <code>{cfg['LOOKBACK']}</code> bars (range 30–300). Example: <code>/setlookback 80</code>"
                 else:
                     try:
                         val = int(arg1)
@@ -1462,11 +1465,11 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>LOOKBACK</code> updated to <code>{val}</code> bars."
                     except ValueError:
-                        reply = f"Enter a whole number from 30 to 300 (current: <code>{cfg['LOOKBACK']}</code>). Example: <code>/setlookback 120</code>"
+                        reply = f"Enter a whole number from 30 to 300 (current: <code>{cfg['LOOKBACK']}</code>). Example: <code>/setlookback 80</code>"
 
             elif cmd == "/setmaxpos":
                 if not arg1:
-                    reply = f"Current <code>MAX_POSITIONS</code>: <code>{cfg['MAX_POSITIONS']}</code> (range 1–10). Example: <code>/setmaxpos 4</code>"
+                    reply = f"Current <code>MAX_POSITIONS</code>: <code>{cfg['MAX_POSITIONS']}</code> (range 1–10). Example: <code>/setmaxpos 3</code>"
                 else:
                     try:
                         val = int(arg1)
@@ -1477,11 +1480,11 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>MAX_POSITIONS</code> updated to <code>{val}</code>."
                     except ValueError:
-                        reply = f"Enter a whole number from 1 to 10 (current: <code>{cfg['MAX_POSITIONS']}</code>). Example: <code>/setmaxpos 4</code>"
+                        reply = f"Enter a whole number from 1 to 10 (current: <code>{cfg['MAX_POSITIONS']}</code>). Example: <code>/setmaxpos 3</code>"
 
             elif cmd == "/setmaxhold":
                 if not arg1:
-                    reply = f"Current <code>MAX_HOLD_MINUTES</code>: <code>{cfg['MAX_HOLD_MINUTES']}</code> min (range 15–4320). Example: <code>/setmaxhold 480</code>"
+                    reply = f"Current <code>MAX_HOLD_MINUTES</code>: <code>{cfg['MAX_HOLD_MINUTES']}</code> min (range 15–4320). Example: <code>/setmaxhold 720</code>"
                 else:
                     try:
                         val = int(arg1)
@@ -1492,11 +1495,11 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>MAX_HOLD_MINUTES</code> updated to <code>{val}</code> min."
                     except ValueError:
-                        reply = f"Enter minutes from 15 to 4320 (current: <code>{cfg['MAX_HOLD_MINUTES']}</code>). Example: <code>/setmaxhold 480</code>"
+                        reply = f"Enter minutes from 15 to 4320 (current: <code>{cfg['MAX_HOLD_MINUTES']}</code>). Example: <code>/setmaxhold 720</code>"
 
             elif cmd == "/setnotional":
                 if not arg1:
-                    reply = f"Current <code>NOTIONAL_USDT</code>: <code>{cfg['NOTIONAL_USDT']}</code> USDT (range 10–10000). Example: <code>/setnotional 150</code>"
+                    reply = f"Current <code>NOTIONAL_USDT</code>: <code>{cfg['NOTIONAL_USDT']}</code> USDT (range 10–10000). Example: <code>/setnotional 100</code>"
                 else:
                     try:
                         val = float(arg1)
@@ -1507,13 +1510,13 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>NOTIONAL_USDT</code> updated to <code>{cfg['NOTIONAL_USDT']}</code> USDT."
                     except ValueError:
-                        reply = f"Enter USDT from 10 to 10000 (current: <code>{cfg['NOTIONAL_USDT']}</code>). Example: <code>/setnotional 150</code>"
+                        reply = f"Enter USDT from 10 to 10000 (current: <code>{cfg['NOTIONAL_USDT']}</code>). Example: <code>/setnotional 100</code>"
 
             elif cmd == "/setz":
                 if not arg1:
                     reply = (
                         f"Current <code>Z_ENTRY</code>: <code>{cfg['Z_ENTRY']}</code> "
-                        f"(must stay between <code>{cfg['Z_EXIT']}</code> and <code>{cfg['Z_STOP']}</code>). Example: <code>/setz 2.2</code>"
+                        f"(must stay between <code>{cfg['Z_EXIT']}</code> and <code>{cfg['Z_STOP']}</code>). Example: <code>/setz 2.0</code>"
                     )
                 else:
                     try:
@@ -1528,13 +1531,13 @@ class StatArbBot:
                             await self.store.save()
                             reply = f"✅ <code>Z_ENTRY</code> updated to <code>{cfg['Z_ENTRY']}</code>."
                     except ValueError:
-                        reply = f"Enter a number from 0.5 to 6.0 (current: <code>{cfg['Z_ENTRY']}</code>). Example: <code>/setz 2.2</code>"
+                        reply = f"Enter a number from 0.5 to 6.0 (current: <code>{cfg['Z_ENTRY']}</code>). Example: <code>/setz 2.0</code>"
 
             elif cmd == "/setzexit":
                 if not arg1:
                     reply = (
                         f"Current <code>Z_EXIT</code>: <code>{cfg['Z_EXIT']}</code> "
-                        f"(must stay below <code>Z_ENTRY {cfg['Z_ENTRY']}</code>). Example: <code>/setzexit 0.4</code>"
+                        f"(must stay below <code>Z_ENTRY {cfg['Z_ENTRY']}</code>). Example: <code>/setzexit 0.5</code>"
                     )
                 else:
                     try:
@@ -1549,13 +1552,13 @@ class StatArbBot:
                             await self.store.save()
                             reply = f"✅ <code>Z_EXIT</code> updated to <code>{cfg['Z_EXIT']}</code>."
                     except ValueError:
-                        reply = f"Enter a number from 0.0 to 3.0 (current: <code>{cfg['Z_EXIT']}</code>). Example: <code>/setzexit 0.4</code>"
+                        reply = f"Enter a number from 0.0 to 3.0 (current: <code>{cfg['Z_EXIT']}</code>). Example: <code>/setzexit 0.5</code>"
 
             elif cmd == "/setzstop":
                 if not arg1:
                     reply = (
                         f"Current <code>Z_STOP</code>: <code>{cfg['Z_STOP']}</code> "
-                        f"(must stay above <code>Z_ENTRY {cfg['Z_ENTRY']}</code>). Example: <code>/setzstop 4.0</code>"
+                        f"(must stay above <code>Z_ENTRY {cfg['Z_ENTRY']}</code>). Example: <code>/setzstop 3.5</code>"
                     )
                 else:
                     try:
@@ -1570,7 +1573,7 @@ class StatArbBot:
                             await self.store.save()
                             reply = f"✅ <code>Z_STOP</code> updated to <code>{cfg['Z_STOP']}</code>."
                     except ValueError:
-                        reply = f"Enter a number from 1.5 to 10.0 (current: <code>{cfg['Z_STOP']}</code>). Example: <code>/setzstop 4.0</code>"
+                        reply = f"Enter a number from 1.5 to 10.0 (current: <code>{cfg['Z_STOP']}</code>). Example: <code>/setzstop 3.5</code>"
 
             else:
                 reply = "Unknown command. Send /help to view all commands."
@@ -1588,7 +1591,7 @@ class StatArbBot:
             ) as resp:
                 await resp.read()
         except Exception as exc:
-            log.warning("deleteWebhook failed: %s", exc)
+            log.warning("deleteWebhook failed: %r", exc)
 
         while True:
             try:
@@ -1613,7 +1616,7 @@ class StatArbBot:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.warning("Telegram poll error: %s", exc)
+                log.warning("Telegram poll error: %r", exc)
                 await asyncio.sleep(3)
 
     async def scanner_loop(self) -> None:
@@ -1800,8 +1803,8 @@ function renderState(s) {
   document.getElementById("modeLine").textContent =
     (s.paused ? "PAUSED" : "RUNNING") +
     " | Mode: " + (cfg.DRY_RUN ? "PAPER" : "LIVE") +
-    " | Top-" + (cfg.TOP_N_COINS || 100) +
-    " | Lookback: " + (cfg.LOOKBACK || 100) +
+    " | Top-" + (cfg.TOP_N_COINS || 35) +
+    " | Lookback: " + (cfg.LOOKBACK || 80) +
     " | Z (In/Out/Stop): " + cfg.Z_ENTRY + "/" + cfg.Z_EXIT + "/" + cfg.Z_STOP +
     " | Notional: $" + cfg.NOTIONAL_USDT +
     " | Daily Cap: $" + (cfg.MAX_DAILY_LOSS_USDT ?? 50) +
@@ -1961,7 +1964,8 @@ fetchState();
 
 
 async def main() -> None:
-    session = aiohttp.ClientSession()
+    connector = aiohttp.TCPConnector(limit=30, keepalive_timeout=20)
+    session = aiohttp.ClientSession(connector=connector)
     store = StateStore()
     await store.init()
     gate = GateClient(session)
@@ -1971,8 +1975,7 @@ async def main() -> None:
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
     async def handle_state(_request: web.Request) -> web.Response:
-        async with store.lock:
-            return web.json_response(store.state)
+        return web.Response(text=store.state_json_cache, content_type="application/json")
 
     async def handle_control(request: web.Request) -> web.Response:
         body = await request.json()
