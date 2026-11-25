@@ -642,8 +642,8 @@ class StatArbBot:
 
         lines = [
             f"📌 <b>STATARB LIVE CARD</b> ({run_state} | <b>{mode}</b>)",
-            f"<b>Equity:</b> <code>{equity:.2f} USDT</code> | <b>Alerts:</b> <code>{alerts_state}</code>",
-            f"<b>Daily:</b> <code>{d_pnl:+.2f}</code> | <b>Realized:</b> <code>{r_pnl:+.2f}</code> | <b>Open:</b> <code>{u_pnl:+.2f}</code>",
+            f"<b>Equity:</b> <code>{equity:.5f} USDT</code> | <b>Alerts:</b> <code>{alerts_state}</code>",
+            f"<b>Daily:</b> <code>{d_pnl:+.5f}</code> | <b>Realized:</b> <code>{r_pnl:+.5f}</code> | <b>Open:</b> <code>{u_pnl:+.5f}</code>",
             f"<b>Record:</b> <code>{wins}W / {losses}L</code> | <b>Slots:</b> <code>{len(positions)}/{max_pos}</code>",
         ]
 
@@ -653,7 +653,7 @@ class StatArbBot:
                 lines.append(
                     f"• <code>{html.escape(str(p.get('pair')))}</code> {html.escape(str(p.get('side')))} "
                     f"Z=<code>{float(p.get('zNow') or 0.0):.2f}</code> "
-                    f"PnL=<code>{float(p.get('unrealizedPnl') or 0.0):+.2f}</code>"
+                    f"PnL=<code>{float(p.get('unrealizedPnl') or 0.0):+.5f}</code>"
                 )
         elif top_pair:
             lines.append(
@@ -848,7 +848,7 @@ class StatArbBot:
             needed = max(0.0, required_margin_usdt) * 1.05
             if available < needed:
                 raise RuntimeError(
-                    f"Insufficient Gate.io USDT available margin ({available:.2f} < {needed:.2f} USDT)"
+                    f"Insufficient Gate.io USDT available margin ({available:.5f} < {needed:.5f} USDT)"
                 )
 
         if not reduce_only:
@@ -929,15 +929,15 @@ class StatArbBot:
 
                 self.store.add_event(
                     "EXIT",
-                    f"Closed {pos['pair']} ({pos['side']}) [{reason}] PnL: {pnl:+.2f} USDT",
+                    f"Closed {pos['pair']} ({pos['side']}) [{reason}] PnL: {pnl:+.5f} USDT",
                 )
 
             state["positions"] = []
             await self.store.save()
             alerts.append(
                 f"🛑 <b>Closed All Positions</b> (<code>{html.escape(reason)}</code>)\n"
-                f"Net Realized PnL: <b>{total_pnl:+.2f} USDT</b>\n"
-                f"Equity: <b>{state['sim_equity']:.2f} USDT</b>"
+                f"Net Realized PnL: <b>{total_pnl:+.5f} USDT</b>\n"
+                f"Equity: <b>{state['sim_equity']:.5f} USDT</b>"
             )
 
         for msg in alerts:
@@ -1068,12 +1068,12 @@ class StatArbBot:
 
                     self.store.add_event(
                         "EXIT",
-                        f"{pos['pair']} {pos['side']} exit [{exit_reason}] PnL {net_pnl:+.2f} USDT",
+                        f"{pos['pair']} {pos['side']} exit [{exit_reason}] PnL {net_pnl:+.5f} USDT",
                     )
                     alerts.append(
                         f"📤 <b>EXIT {html.escape(pos['pair'])}</b> ({html.escape(pos['side'])})\n"
                         f"Reason: <code>{html.escape(exit_reason)}</code> | Z: <code>{z_now:.2f}</code>\n"
-                        f"PnL: <b>{net_pnl:+.2f} USDT</b> | Equity: <b>{state['sim_equity']:.2f} USDT</b>"
+                        f"PnL: <b>{net_pnl:+.5f} USDT</b> | Equity: <b>{state['sim_equity']:.5f} USDT</b>"
                     )
                 else:
                     remaining_positions.append(pos)
@@ -1181,7 +1181,7 @@ class StatArbBot:
                         f"📥 <b>ENTRY {html.escape(cand['pair'])}</b> ({html.escape(cand['signal'])})\n"
                         f"Z: <code>{cand['zNow']:.2f}</code> | β: <code>{cand['beta']:.2f}</code> | "
                         f"ADF: <code>{cand['adf']:.2f}</code> | HL: <code>{cand['halfLifeBars']}b</code>\n"
-                        f"Edge: <b>{cand['edgePct']:.2f}% ({cand['edgeUsdt']:.2f} USDT)</b>"
+                        f"Edge: <b>{cand['edgePct']:.2f}% ({cand['edgeUsdt']:.5f} USDT)</b>"
                     )
 
             await self.store.save()
@@ -1243,7 +1243,7 @@ class StatArbBot:
             await self.send_telegram(
                 f"📥 <b>TEST ENTRY {html.escape('BTC_USDT/ETH_USDT')}</b> (LONG_SPREAD)\n"
                 f"Z: <code>-2.15</code> | β: <code>1.04</code> | ADF: <code>-3.10</code> | HL: <code>18.5b</code>\n"
-                f"Edge: <b>0.42% (0.85 USDT)</b>",
+                f"Edge: <b>0.42% (0.85000 USDT)</b>",
                 chat_id,
             )
             return
@@ -1264,15 +1264,15 @@ class StatArbBot:
                 try:
                     acct = await self.gate.get_usdt_futures_account()
                     live_line = (
-                        f"\n<b>Gate USDT Available:</b> <code>{acct['available']:.2f} USDT</code> | "
-                        f"<b>Total:</b> <code>{acct['total']:.2f} USDT</code>"
+                        f"\n<b>Gate USDT Available:</b> <code>{acct['available']:.5f} USDT</code> | "
+                        f"<b>Total:</b> <code>{acct['total']:.5f} USDT</code>"
                     )
                 except Exception as exc:
                     live_line = f"\n<b>Gate Account Check:</b> <code>{html.escape(str(exc))}</code>"
 
             await self.send_telegram(
                 f"<b>Mode:</b> {'Paper (<code>DRY_RUN=true</code>)' if cfg['DRY_RUN'] else 'Live (<code>DRY_RUN=false</code>)'}\n"
-                f"<b>Equity:</b> <code>{sim_eq:.2f} USDT</code> | <b>Daily Realized:</b> <code>{d_pnl:+.2f} USDT</code>\n"
+                f"<b>Equity:</b> <code>{sim_eq:.5f} USDT</code> | <b>Daily Realized:</b> <code>{d_pnl:+.5f} USDT</code>\n"
                 f"<b>Daily Loss Cap:</b> <code>{cfg['MAX_DAILY_LOSS_USDT']} USDT</code>\n"
                 f"<b>Leg Y Notional:</b> <code>{cfg['NOTIONAL_USDT']} USDT</code> | <b>Max Hold:</b> <code>{cfg['MAX_HOLD_MINUTES']}m</code>"
                 f"{live_line}",
@@ -1295,8 +1295,8 @@ class StatArbBot:
                     f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b> | Alerts: <code>{alerts_state}</code>\n"
                     f"<b>Positions:</b> <code>{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}</code> | "
                     f"<b>Z Entry/Exit/Stop:</b> <code>{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}</code>\n"
-                    f"<b>Daily Realized:</b> <code>{d_pnl:+.2f} USDT</code> (Cap: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code>) | "
-                    f"<b>Open PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
+                    f"<b>Daily Realized:</b> <code>{d_pnl:+.5f} USDT</code> (Cap: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code>) | "
+                    f"<b>Open PnL:</b> <code>{u_pnl:+.5f} USDT</code>\n"
                     f"<b>Last Tick:</b> {html.escape(fmt_ist(state.get('last_tick_ts')))}"
                 )
                 if state.get("last_error"):
@@ -1305,10 +1305,10 @@ class StatArbBot:
             elif cmd == "/pnl":
                 u_pnl = sum(float(p.get("unrealizedPnl") or 0.0) for p in state.get("positions", []))
                 reply = (
-                    f"<b>Daily Realized PnL:</b> <code>{float(state.get('daily_realized_pnl', 0.0)):+.2f} USDT</code>\n"
-                    f"<b>Total Realized PnL:</b> <code>{float(state.get('realized_pnl', 0.0)):+.2f} USDT</code>\n"
-                    f"<b>Unrealized PnL:</b> <code>{u_pnl:+.2f} USDT</code>\n"
-                    f"<b>Equity:</b> <code>{float(state.get('sim_equity', INITIAL_EQUITY)):.2f} USDT</code>\n"
+                    f"<b>Daily Realized PnL:</b> <code>{float(state.get('daily_realized_pnl', 0.0)):+.5f} USDT</code>\n"
+                    f"<b>Total Realized PnL:</b> <code>{float(state.get('realized_pnl', 0.0)):+.5f} USDT</code>\n"
+                    f"<b>Unrealized PnL:</b> <code>{u_pnl:+.5f} USDT</code>\n"
+                    f"<b>Equity:</b> <code>{float(state.get('sim_equity', INITIAL_EQUITY)):.5f} USDT</code>\n"
                     f"<b>Record:</b> <code>{state.get('wins', 0)}W / {state.get('losses', 0)}L</code>"
                 )
 
@@ -1326,7 +1326,7 @@ class StatArbBot:
                 for t in state.get("trades", [])[:6]:
                     lines.append(
                         f"• <b>{html.escape(t['pair'])}</b> {html.escape(t['side'])} "
-                        f"<code>{float(t['pnl']):+.2f}</code> [{html.escape(t['reason'])}] ({html.escape(fmt_ist(t.get('exitTs')))})"
+                        f"<code>{float(t['pnl']):+.5f}</code> [{html.escape(t['reason'])}] ({html.escape(fmt_ist(t.get('exitTs')))})"
                     )
                 reply = "\n".join(lines) if lines else "No closed trades yet."
 
@@ -1427,7 +1427,7 @@ class StatArbBot:
                         val = float(arg1)
                         if not (0.0 <= val <= 100000.0):
                             raise ValueError
-                        cfg["MAX_DAILY_LOSS_USDT"] = round(val, 2)
+                        cfg["MAX_DAILY_LOSS_USDT"] = round(val, 5)
                         self.store.add_event("CONFIG", f"MAX_DAILY_LOSS_USDT updated to {cfg['MAX_DAILY_LOSS_USDT']}")
                         await self.store.save()
                         reply = f"✅ <code>MAX_DAILY_LOSS_USDT</code> updated to <code>{cfg['MAX_DAILY_LOSS_USDT']}</code> USDT."
@@ -1502,7 +1502,7 @@ class StatArbBot:
                         val = float(arg1)
                         if not (10.0 <= val <= 10000.0):
                             raise ValueError
-                        cfg["NOTIONAL_USDT"] = round(val, 2)
+                        cfg["NOTIONAL_USDT"] = round(val, 5)
                         self.store.add_event("CONFIG", f"NOTIONAL_USDT updated to {cfg['NOTIONAL_USDT']}")
                         await self.store.save()
                         reply = f"✅ <code>NOTIONAL_USDT</code> updated to <code>{cfg['NOTIONAL_USDT']}</code> USDT."
@@ -1813,10 +1813,10 @@ function renderState(s) {
 
   const uPnl = (s.positions || []).reduce((acc, p) => acc + (Number(p.unrealizedPnl) || 0), 0);
   const kpis = [
-    ["Equity (USDT)", Number(s.sim_equity || 0).toFixed(2), ""],
-    ["Daily PnL", (s.daily_realized_pnl >= 0 ? "+" : "") + Number(s.daily_realized_pnl || 0).toFixed(2), (s.daily_realized_pnl || 0) >= 0 ? "pos" : "neg"],
-    ["Total Realized", (s.realized_pnl >= 0 ? "+" : "") + Number(s.realized_pnl || 0).toFixed(2), (s.realized_pnl || 0) >= 0 ? "pos" : "neg"],
-    ["Unrealized PnL", (uPnl >= 0 ? "+" : "") + uPnl.toFixed(2), uPnl >= 0 ? "pos" : "neg"],
+    ["Equity (USDT)", Number(s.sim_equity || 0).toFixed(5), ""],
+    ["Daily PnL", (s.daily_realized_pnl >= 0 ? "+" : "") + Number(s.daily_realized_pnl || 0).toFixed(5), (s.daily_realized_pnl || 0) >= 0 ? "pos" : "neg"],
+    ["Total Realized", (s.realized_pnl >= 0 ? "+" : "") + Number(s.realized_pnl || 0).toFixed(5), (s.realized_pnl || 0) >= 0 ? "pos" : "neg"],
+    ["Unrealized PnL", (uPnl >= 0 ? "+" : "") + uPnl.toFixed(5), uPnl >= 0 ? "pos" : "neg"],
     ["Win / Loss", (s.wins || 0) + "W / " + (s.losses || 0) + "L", ""],
     ["Open Slots", (s.positions || []).length + " / " + (cfg.MAX_POSITIONS || 3), ""]
   ];
@@ -1837,8 +1837,8 @@ function renderState(s) {
         '<td>' + Number(p.entryPriceY).toFixed(4) + ' / ' + Number(p.curPriceY).toFixed(4) + '</td>' +
         '<td>' + Number(p.entryPriceX).toFixed(4) + ' / ' + Number(p.curPriceX).toFixed(4) + '</td>' +
         '<td>' + Number(p.zEntry).toFixed(2) + ' / ' + Number(p.zNow).toFixed(2) + '</td>' +
-        '<td>' + Number(p.edgePct).toFixed(2) + '% / $' + Number(p.edgeUsdt).toFixed(2) + '</td>' +
-        '<td class="' + pnlCls + '">' + (p.unrealizedPnl >= 0 ? "+" : "") + Number(p.unrealizedPnl).toFixed(2) + '</td>' +
+        '<td>' + Number(p.edgePct).toFixed(2) + '% / $' + Number(p.edgeUsdt).toFixed(5) + '</td>' +
+        '<td class="' + pnlCls + '">' + (p.unrealizedPnl >= 0 ? "+" : "") + Number(p.unrealizedPnl).toFixed(5) + '</td>' +
         '<td>' + Number(p.beta).toFixed(2) + '</td>' +
         '<td>' + Number(p.adf).toFixed(2) + '</td>' +
         '<td>' + esc(p.halfLifeBars ?? "-") + '</td>' +
@@ -1865,7 +1865,7 @@ function renderState(s) {
         '<td>' + esc(p.halfLifeBars ?? "-") + '</td>' +
         '<td>' + Number(p.corr).toFixed(2) + '</td>' +
         '<td>' + Number(p.edgePct).toFixed(2) + '%</td>' +
-        '<td>$' + Number(p.edgeUsdt).toFixed(2) + '</td>' +
+        '<td>$' + Number(p.edgeUsdt).toFixed(5) + '</td>' +
       '</tr>';
     }).join("");
   }
@@ -1881,7 +1881,7 @@ function renderState(s) {
         '<td>' + esc(t.side) + '</td>' +
         '<td>' + esc(t.qtyY) + ' / ' + esc(t.qtyX) + '</td>' +
         '<td>' + Number(t.zEntry).toFixed(2) + ' / ' + Number(t.zExit).toFixed(2) + '</td>' +
-        '<td class="' + cls + '">' + (t.pnl >= 0 ? "+" : "") + Number(t.pnl).toFixed(2) + '</td>' +
+        '<td class="' + cls + '">' + (t.pnl >= 0 ? "+" : "") + Number(t.pnl).toFixed(5) + '</td>' +
         '<td>' + esc(t.reason) + '</td>' +
         '<td>' + fmtIST(t.entryTs) + '</td>' +
         '<td>' + fmtIST(t.exitTs) + '</td>' +
