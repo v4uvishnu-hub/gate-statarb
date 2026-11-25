@@ -13,11 +13,15 @@ from pydantic import BaseModel
 import uvicorn
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION (PUBLIC API / NO KEY NEEDED)
 # ==========================================
-API_KEY = os.getenv("GATE_API_KEY", "YOUR_GATE_API_KEY")
-API_SECRET = os.getenv("GATE_API_SECRET", "YOUR_GATE_API_SECRET")
-USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
+API_KEY = os.getenv("GATE_API_KEY", "").strip()
+API_SECRET = os.getenv("GATE_API_SECRET", "").strip()
+USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"
+
+# Automatically runs in paper-execution mode when API keys are omitted
+HAS_PRIVATE_KEYS = bool(API_KEY and API_SECRET)
+PAPER_MODE = os.getenv("PAPER_MODE", "true" if not HAS_PRIVATE_KEYS else "false").lower() == "true" or not HAS_PRIVATE_KEYS
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_STATE_KEY = "atr_trend_bot:state"
@@ -25,12 +29,12 @@ REDIS_STATS_KEY = "atr_trend_bot:stats"
 REDIS_HISTORY_KEY = "atr_trend_bot:history"
 MAX_TRADE_HISTORY = 100
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("PORT") or os.getenv("WEB_UI_PORT") or "8080")
-WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "")
+WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "").strip()
 
 # Universe, Rotation & Concurrent Position Settings
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
@@ -86,15 +90,23 @@ last_universe_refresh_ts: float = 0.0
 
 rds = redis.from_url(REDIS_URL, decode_responses=True)
 
-exchange = ccxt.gate({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
+exchange_cfg: dict = {
     "enableRateLimit": True,
     "options": {"defaultType": "swap"},
-})
+}
+if HAS_PRIVATE_KEYS:
+    exchange_cfg["apiKey"] = API_KEY
+    exchange_cfg["secret"] = API_SECRET
 
+exchange = ccxt.gate(exchange_cfg)
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
+
+
+def mode_label() -> str:
+    if PAPER_MODE:
+        return "PUBLIC-PAPER"
+    return "TESTNET" if USE_TESTNET else "LIVE"
 
 
 # ==========================================
@@ -214,7 +226,7 @@ def load_trade_history(limit: int = 25) -> list[dict]:
 
 
 # ==========================================
-# UNIVERSE DISCOVERY & ROTATION
+# UNIVERSE DISCOVERY & ROTATION (PUBLIC)
 # ==========================================
 def _quote_volume_24h(ticker: dict | None) -> float:
     if not ticker:
@@ -254,7 +266,7 @@ def get_top_gate_perp_symbols(markets: dict, force_refresh: bool = False) -> lis
         try:
             tickers = exchange.fetch_tickers()
         except Exception as e:
-            logging.warning(f"fetch_tickers() for Top {TOP_N_COINS} failed ({e}); using cached/pinned symbols.")
+            logging.warning(f"Public fetch_tickers() failed ({e}); using cached/pinned symbols.")
             tickers = {}
 
         ranked: list[tuple[float, str]] = []
@@ -287,11 +299,6 @@ def get_top_gate_perp_symbols(markets: dict, force_refresh: bool = False) -> lis
 
 
 def get_next_scan_slice(markets: dict) -> tuple[list[str], int, int]:
-    """
-    Returns (symbols_to_scan, next_cursor, rotatable_total) where PINNED_SYMBOLS
-    are checked first and a slice of up to MAX_PAIRS_PER_CYCLE rotates through
-    the remaining Top-N Gate.io USDT perpetuals.
-    """
     top_symbols = get_top_gate_perp_symbols(markets)
     pinned_set = set(PINNED_SYMBOLS)
 
@@ -318,7 +325,7 @@ def get_next_scan_slice(markets: dict) -> tuple[list[str], int, int]:
 
 
 # ==========================================
-# INDICATORS & MARKET DATA
+# INDICATORS & PUBLIC MARKET DATA
 # ==========================================
 def calc_ema(values: list[float], period: int) -> float:
     mult = 2.0 / (period + 1)
@@ -388,7 +395,17 @@ def compute_order_amount(market: dict, symbol: str, spot: float, stop_distance: 
     return float(exchange.amount_to_precision(symbol, qty))
 
 
-def place_market_order(symbol: str, side: str, amount: float) -> dict:
+def place_order(symbol: str, side: str, amount: float, ref_price: float | None = None) -> dict:
+    if PAPER_MODE:
+        px = float(ref_price) if ref_price and ref_price > 0 else fetch_mark_price(symbol, 0.0)
+        return {
+            "id": f"paper-{int(time.time() * 1000)}",
+            "symbol": symbol,
+            "side": side,
+            "amount": amount,
+            "average": px,
+            "status": "closed",
+        }
     return exchange.create_order(symbol, "market", side, amount)
 
 
@@ -400,7 +417,7 @@ def _fmt_px(val: float) -> str:
 # TELEGRAM API, LIVE CARD & COMMANDS
 # ==========================================
 def _tg_configured() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN) and "YOUR_TELEGRAM" not in TELEGRAM_BOT_TOKEN
+    return bool(TELEGRAM_BOT_TOKEN)
 
 
 def _tg_api(method: str, payload: dict):
@@ -480,7 +497,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     realized = float(stats.get("realized_pnl", 0.0))
 
     return (
-        f"<b>ATR Top-{TOP_N_COINS} Bot [{status_flag}]</b>\n"
+        f"<b>ATR Top-{TOP_N_COINS} [{mode_label()}] [{status_flag}]</b>\n"
         f"{position_block}\n\n"
         f"<b>Realized Stats:</b> {wins}W / {losses}L ({win_rate:.1f}%) | "
         f"PnL: <code>{realized:+.4f}</code>\n"
@@ -553,10 +570,9 @@ def pinned_card_worker():
 def close_single_position(trade: dict, reason: str, exit_price_hint: float | None = None) -> float:
     sym = trade["symbol"]
     close_side = "sell" if trade["side"] == "long" else "buy"
-    order = place_market_order(sym, close_side, float(trade["amount"]))
-    exit_px = float(order.get("average") or order.get("price") or 0.0)
-    if exit_px <= 0:
-        exit_px = exit_price_hint if exit_price_hint is not None else fetch_mark_price(sym, float(trade["entry_price"]))
+    ref_px = exit_price_hint if exit_price_hint is not None else fetch_mark_price(sym, float(trade["entry_price"]))
+    order = place_order(sym, close_side, float(trade["amount"]), ref_price=ref_px)
+    exit_px = float(order.get("average") or order.get("price") or ref_px)
 
     pnl = calc_unrealized_pnl(trade, exit_px)
     update_stats(pnl)
@@ -671,7 +687,9 @@ def telegram_command_worker():
                     scan = (res or {}).get("last_scan") or {}
                     pairs_txt = ""
                     for p in scan.get("pair_summaries") or []:
-                        pairs_txt += f"\n• <code>{p.get('symbol')}</code>: {p.get('detail')}"
+                        pct = p.get("open_readiness_pct")
+                        pct_str = f" [{float(pct):.0f}%]" if pct is not None else ""
+                        pairs_txt += f"\n• <code>{p.get('symbol')}</code>{pct_str}: {p.get('detail')}"
                     send_telegram(
                         f"<b>Scan [{scan.get('status', 'UNKNOWN')}]</b>\n"
                         f"Summary: {scan.get('reason', '--')}{pairs_txt}\n"
@@ -743,7 +761,6 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                 trades = list(state.get("active_trades") or [])
                 paused = bool(state.get("paused", False))
 
-            # 1. Monitor all open positions first
             updated_trades: list[dict] = []
             for tr in trades:
                 sym = tr["symbol"]
@@ -849,18 +866,34 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                     if atr <= 0:
                         continue
 
-                    band = PULLBACK_ATR_BAND * atr
+                    band = max(1e-8, PULLBACK_ATR_BAND * atr)
+                    trend_bullish = spot > ema_50
+                    trend_bearish = spot < ema_50
+                    dist_to_20 = abs(spot - ema_20_15m)
+
                     setup_side = None
-                    if spot > ema_50 and abs(spot - ema_20_15m) <= band and spot >= ema_20_15m * 0.997:
+                    if trend_bullish and dist_to_20 <= band and spot >= ema_20_15m * 0.997:
                         setup_side = "long"
-                    elif spot < ema_50 and abs(spot - ema_20_15m) <= band and spot <= ema_20_15m * 1.003:
+                    elif trend_bearish and dist_to_20 <= band and spot <= ema_20_15m * 1.003:
                         setup_side = "short"
 
                     if not setup_side:
+                        if trend_bullish or trend_bearish:
+                            pullback_ratio = max(0.0, min(1.0, 1.0 - (dist_to_20 / (3.0 * band))))
+                            readiness_pct = round(pullback_ratio * 99.0, 1)
+                            regime_tag = "Bull 1h" if trend_bullish else "Bear 1h"
+                        else:
+                            readiness_pct = 0.0
+                            regime_tag = "Flat 1h"
+
                         if len(pair_summaries) < 12:
                             pair_summaries.append({
                                 "symbol": sym,
-                                "detail": f"Spot={_fmt_px(spot)} vs 1hEMA50={_fmt_px(ema_50)}, 15mEMA20={_fmt_px(ema_20_15m)}",
+                                "open_readiness_pct": readiness_pct,
+                                "detail": (
+                                    f"{regime_tag} · Spot={_fmt_px(spot)} vs 1hEMA50={_fmt_px(ema_50)}, "
+                                    f"15mEMA20={_fmt_px(ema_20_15m)}"
+                                ),
                             })
                         continue
 
@@ -870,7 +903,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                         continue
 
                     order_side = "buy" if setup_side == "long" else "sell"
-                    order = place_market_order(sym, order_side, amt)
+                    order = place_order(sym, order_side, amt, ref_price=spot)
                     entry_px = float(order.get("average") or order.get("price") or spot)
                     stop_px = entry_px - STOP_ATR_MULT * atr if setup_side == "long" else entry_px + STOP_ATR_MULT * atr
                     tp_px = entry_px + TP_ATR_MULT * atr if setup_side == "long" else entry_px - TP_ATR_MULT * atr
@@ -895,10 +928,14 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
 
                     open_syms.add(sym)
                     opened_new = True
-                    pair_summaries.insert(0, {"symbol": sym, "detail": f"OPENED {setup_side.upper()} @ {_fmt_px(entry_px)}"})
+                    pair_summaries.insert(0, {
+                        "symbol": sym,
+                        "open_readiness_pct": 100.0,
+                        "detail": f"OPENED {setup_side.upper()} @ {_fmt_px(entry_px)}",
+                    })
 
                     send_telegram(
-                        f"<b>New {setup_side.upper()} Opened ({len(open_syms)}/{MAX_OPEN_POSITIONS})</b>\n"
+                        f"<b>New {setup_side.upper()} Opened [{mode_label()}] ({len(open_syms)}/{MAX_OPEN_POSITIONS})</b>\n"
                         f"Pair: <code>{sym}</code> | Qty: <code>{amt}</code>\n"
                         f"Entry: <code>{_fmt_px(entry_px)}</code> | Stop: <code>{_fmt_px(stop_px)}</code> | "
                         f"TP: <code>{_fmt_px(tp_px)}</code>\n"
@@ -979,7 +1016,8 @@ def healthz():
     return {
         "status": "ok" if redis_ok else "degraded",
         "redis": redis_ok,
-        "mode": "TESTNET" if USE_TESTNET else "LIVE",
+        "mode": mode_label(),
+        "has_api_keys": HAS_PRIVATE_KEYS,
         "port": WEB_UI_PORT,
         "top_n_coins": TOP_N_COINS,
         "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
@@ -1037,7 +1075,8 @@ def api_state():
 
     return {
         "server_time_ist": now_ist,
-        "mode": "TESTNET" if USE_TESTNET else "LIVE",
+        "mode": mode_label(),
+        "has_api_keys": HAS_PRIVATE_KEYS,
         "top_n_coins": TOP_N_COINS,
         "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
         "pinned_symbols": PINNED_SYMBOLS,
@@ -1117,7 +1156,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>ATR Top-100 Bot</title>
+<title>ATR Top-100 Bot (Public API)</title>
 <style>
   :root {
     --bg: #0b0f17; --card: #131a26; --border: #222d40;
@@ -1140,7 +1179,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .val { font-size: 1.4rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
   .pos { color: var(--green); } .neg { color: var(--red); }
   .scan-reason { margin-top: 8px; font-size: 0.9rem; color: var(--amber); }
-  .pair-list { margin-top: 10px; display: grid; gap: 6px; font-size: 0.84rem; color: var(--muted); }
+  .pair-list { margin-top: 10px; display: grid; gap: 8px; font-size: 0.84rem; color: var(--muted); }
+  .coin-item { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: #0f1520; }
+  .coin-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 0.84rem; }
+  .coin-bar-bg { width: 100%; height: 6px; background: #1c2536; border-radius: 999px; overflow: hidden; margin-top: 6px; }
+  .coin-bar-fill { height: 100%; background: linear-gradient(90deg, var(--amber), var(--blue), var(--green)); transition: width .35s ease; }
   .pos-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; background: #0f1520; }
   .bar-bg { width: 100%; height: 8px; background: #1c2536; border-radius: 999px; overflow: hidden; margin-top: 8px; }
   .bar-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .4s ease; }
@@ -1162,7 +1205,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="topbar">
     <div class="title">
       ATR Top-100 Pullback Bot
-      <span id="modeBadge" class="badge badge-mode">TESTNET</span>
+      <span id="modeBadge" class="badge badge-mode">PUBLIC-PAPER</span>
       <span id="statusBadge" class="badge badge-run">RUNNING</span>
     </div>
     <div class="meta">
@@ -1262,9 +1305,16 @@ async function fetchState() {
       rEl.textContent = `[${scan.status || "INFO"}] ${scan.reason || ""}`;
       rEl.style.color = scan.status === "OPENED" ? "var(--green)" : (scan.status === "ERROR" ? "var(--red)" : "var(--amber)");
       const ps = scan.pair_summaries || [];
-      document.getElementById("pairSummaries").innerHTML = ps.map(p =>
-        `<div><code>${p.symbol}</code> — ${p.detail}</div>`
-      ).join("");
+      document.getElementById("pairSummaries").innerHTML = ps.map(p => {
+        const pct = Math.max(0, Math.min(100, Number(p.open_readiness_pct ?? 0)));
+        return `<div class="coin-item">
+          <div class="coin-top">
+            <div><code>${p.symbol}</code> — <span>${p.detail}</span></div>
+            <b>${pct.toFixed(0)}% to open</b>
+          </div>
+          <div class="coin-bar-bg"><div class="coin-bar-fill" style="width:${pct}%;"></div></div>
+        </div>`;
+      }).join("");
     }
 
     const stats = data.stats || {};
@@ -1429,13 +1479,12 @@ def run_bot():
     state = load_state()
 
     send_telegram(
-        f"<b>ATR Top-{TOP_N_COINS} Bot Started</b>\n"
-        f"Mode: <code>{'TESTNET' if USE_TESTNET else 'LIVE'}</code> | "
+        f"<b>ATR Top-{TOP_N_COINS} Bot Started [{mode_label()}]</b>\n"
         f"Max Positions: <code>{MAX_OPEN_POSITIONS}</code> | Slice: <code>{MAX_PAIRS_PER_CYCLE}/cycle</code>\n"
         f"Risk/Trade: <code>{RISK_PER_TRADE_USDT:.2f} USDT</code> | Port: <code>{WEB_UI_PORT}</code>"
     )
     ensure_and_update_pinned_card(force_new=False)
-    logging.info(f"ATR Top-{TOP_N_COINS} Bot started on port {WEB_UI_PORT}.")
+    logging.info(f"ATR Top-{TOP_N_COINS} Bot started in {mode_label()} mode on port {WEB_UI_PORT}.")
 
     while True:
         perform_scan_cycle(cached_markets)
