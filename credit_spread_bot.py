@@ -37,10 +37,12 @@ UNDERLYING = "BTC/USDT"
 CONTRACTS = float(os.getenv("CONTRACTS", "1"))
 MIN_DTE = 3
 MAX_DTE = 7
-MIN_CREDIT_RATIO = 0.15
+MIN_CREDIT_RATIO = 0.05
 
 TARGET_SHORT_PUT_DELTA = -0.25
 TARGET_LONG_PUT_DELTA = -0.10
+TARGET_SHORT_CALL_DELTA = 0.25
+TARGET_LONG_CALL_DELTA = 0.10
 MAX_DELTA_DIFF = 0.08
 RISK_FREE_RATE = 0.0
 
@@ -96,6 +98,7 @@ def load_state() -> dict:
             data.setdefault("paused", False)
             data.setdefault("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)
             data.setdefault("pin_message_id", None)
+            data.setdefault("last_scan", None)
             return data
         except json.JSONDecodeError:
             logging.error("Corrupted Redis state JSON; resetting to default.")
@@ -104,11 +107,38 @@ def load_state() -> dict:
         "paused": False,
         "pin_interval_sec": PIN_INTERVAL_DEFAULT_SEC,
         "pin_message_id": None,
+        "last_scan": None,
     }
 
 
 def save_state(state: dict):
     rds.set(REDIS_STATE_KEY, json.dumps(state))
+
+
+def record_scan_diagnostics(
+    status: str,
+    reason: str,
+    spot: float | None = None,
+    ema_50: float | None = None,
+    spread_type: str | None = None,
+    spread_label: str | None = None,
+    credit_ratio: float | None = None,
+):
+    now_ist = datetime.now(IST).strftime("%d %b %H:%M:%S IST")
+    scan_info = {
+        "checked_at_ist": now_ist,
+        "status": status,
+        "reason": reason,
+        "spot": round(float(spot), 2) if spot is not None else None,
+        "ema_50": round(float(ema_50), 2) if ema_50 is not None else None,
+        "spread_type": spread_type,
+        "spread_label": spread_label,
+        "credit_ratio_pct": round(float(credit_ratio) * 100.0, 2) if credit_ratio is not None else None,
+    }
+    with state_lock:
+        state = load_state()
+        state["last_scan"] = scan_info
+        save_state(state)
 
 
 def load_stats() -> dict:
@@ -135,6 +165,8 @@ def update_stats(pnl: float):
 def record_closed_trade(trade: dict, realized_pnl: float, exit_reason: str):
     now_iso = datetime.now(timezone.utc).isoformat()
     record = {
+        "spread_type": trade.get("spread_type"),
+        "spread_label": trade.get("spread_label"),
         "short_sym": trade.get("short_sym"),
         "long_sym": trade.get("long_sym"),
         "short_strike": trade.get("short_strike"),
@@ -230,18 +262,26 @@ def _bs_put_delta(spot: float, strike: float, t_years: float, iv: float, r: floa
     return _norm_cdf(d1) - 1.0
 
 
-def _estimate_live_put_delta(trade: dict, side: str, now_ms: int) -> float | None:
+def _bs_call_delta(spot: float, strike: float, t_years: float, iv: float, r: float = RISK_FREE_RATE) -> float:
+    if t_years <= 0.0 or iv <= 0.0 or spot <= 0.0 or strike <= 0.0:
+        return 1.0 if spot > strike else 0.0
+    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * math.sqrt(t_years))
+    return _norm_cdf(d1)
+
+
+def _estimate_live_leg_delta(trade: dict, side: str, now_ms: int) -> float | None:
     key = "short_delta" if side == "short" else "long_delta"
     if trade.get(key) is not None:
         return float(trade[key])
     try:
+        is_call = trade.get("spread_type") == "bear_call"
         strike = float(trade.get("short_strike" if side == "short" else "long_strike") or 0.0)
         expiry_ms = int(trade.get("expiry_ms") or 0)
         t_years = max((expiry_ms - now_ms) / (1000 * 60 * 60 * 24 * 365.0), 1e-6)
         ticker = exchange.fetch_ticker(UNDERLYING)
         spot = float(ticker.get("last") or 0.0)
         if spot > 0 and strike > 0:
-            return _bs_put_delta(spot, strike, t_years, 0.60)
+            return _bs_call_delta(spot, strike, t_years, 0.60) if is_call else _bs_put_delta(spot, strike, t_years, 0.60)
     except Exception:
         pass
     return None
@@ -253,6 +293,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     status_flag = "PAUSED" if state.get("paused") else "RUNNING"
     pin_sec = int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC))
     trade = state.get("active_trade")
+    last_scan = state.get("last_scan")
 
     if trade:
         try:
@@ -262,24 +303,26 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
             pnl_line = f"Live Spread PnL: <i>Quote unavailable ({e})</i>"
 
         hours_left = max(0.0, (int(trade.get("expiry_ms", now_ms)) - now_ms) / 3600000.0)
-        s_delta = _estimate_live_put_delta(trade, "short", now_ms)
-        l_delta = _estimate_live_put_delta(trade, "long", now_ms)
+        s_delta = _estimate_live_leg_delta(trade, "short", now_ms)
+        l_delta = _estimate_live_leg_delta(trade, "long", now_ms)
         s_delta_str = f"{s_delta:+.3f}" if s_delta is not None else "N/A"
         l_delta_str = f"{l_delta:+.3f}" if l_delta is not None else "N/A"
-        net_delta_str = f"{-(s_delta - l_delta):+.3f}" if (s_delta is not None and l_delta is not None) else "N/A"
+        spread_label = trade.get("spread_label") or "Credit Spread"
 
         position_block = (
-            f"<b>Active Spread:</b> Bull Put\n"
+            f"<b>Active Spread:</b> {spread_label}\n"
             f"Short: <code>{trade.get('short_sym')}</code> (Δ <code>{s_delta_str}</code>)\n"
             f"Long:  <code>{trade.get('long_sym')}</code> (Δ <code>{l_delta_str}</code>)\n"
-            f"Net Spread Δ: <code>{net_delta_str}</code>\n"
             f"Entry Credit: <code>{float(trade.get('entry_credit', 0.0)):.4f}</code> | "
             f"Max Loss: <code>{float(trade.get('max_loss', 0.0)):.4f}</code>\n"
             f"{pnl_line}\n"
             f"Time to Expiry: <code>{hours_left:.1f}h</code>"
         )
     else:
-        position_block = "<b>Active Spread:</b> None (Flat / Scanning)"
+        scan_note = ""
+        if last_scan:
+            scan_note = f"\n<i>Last Scan: {last_scan.get('reason')}</i>"
+        position_block = f"<b>Active Spread:</b> None (Flat / Scanning){scan_note}"
 
     total = int(stats.get("total_trades", 0))
     wins = int(stats.get("wins", 0))
@@ -465,7 +508,7 @@ def telegram_command_worker():
 
 
 # ==========================================
-# DELTA STRIKE SELECTION & CHASE/UNWIND EXECUTION
+# DUAL-REGIME DELTA STRIKE SELECTION & EXECUTION
 # ==========================================
 def get_spot_and_ema(ema_period: int = 50):
     ohlcv = exchange.fetch_ohlcv(UNDERLYING, timeframe="1h", limit=ema_period + 10)
@@ -487,14 +530,28 @@ def _bs_put_price(spot: float, strike: float, t_years: float, iv: float, r: floa
     return strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
 
-def _implied_put_vol(price: float, spot: float, strike: float, t_years: float, r: float = RISK_FREE_RATE) -> float:
-    intrinsic = max(0.0, strike * math.exp(-r * t_years) - spot)
+def _bs_call_price(spot: float, strike: float, t_years: float, iv: float, r: float = RISK_FREE_RATE) -> float:
+    if t_years <= 0.0 or iv <= 0.0:
+        return max(0.0, spot - strike)
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * sqrt_t)
+    d2 = d1 - iv * sqrt_t
+    return spot * _norm_cdf(d1) - strike * math.exp(-r * t_years) * _norm_cdf(d2)
+
+
+def _implied_option_vol(option_type: str, price: float, spot: float, strike: float, t_years: float, r: float = RISK_FREE_RATE) -> float:
+    is_call = option_type == "call"
+    intrinsic = (
+        max(0.0, spot - strike * math.exp(-r * t_years))
+        if is_call
+        else max(0.0, strike * math.exp(-r * t_years) - spot)
+    )
     if price <= intrinsic + 1e-8 or t_years <= 0.0:
         return 0.60
     low, high = 0.05, 3.0
     for _ in range(50):
         mid = 0.5 * (low + high)
-        px = _bs_put_price(spot, strike, t_years, mid, r)
+        px = _bs_call_price(spot, strike, t_years, mid, r) if is_call else _bs_put_price(spot, strike, t_years, mid, r)
         if abs(px - price) < 1e-6:
             return mid
         if px > price:
@@ -504,7 +561,8 @@ def _implied_put_vol(price: float, spot: float, strike: float, t_years: float, r
     return 0.5 * (low + high)
 
 
-def _extract_put_delta(market: dict, ticker: dict | None, spot: float, t_years: float) -> float | None:
+def _extract_option_delta(option_type: str, market: dict, ticker: dict | None, spot: float, t_years: float) -> float | None:
+    is_call = option_type == "call"
     info = (ticker or {}).get("info") or {}
     greeks = (ticker or {}).get("greeks") or info.get("greeks") or {}
 
@@ -523,7 +581,7 @@ def _extract_put_delta(market: dict, ticker: dict | None, spot: float, t_years: 
                 pass
 
     if raw_delta is not None:
-        return raw_delta if raw_delta <= 0 else -raw_delta
+        return abs(raw_delta) if is_call else (-abs(raw_delta))
 
     strike = float(market.get("strike") or 0.0)
     bid = (ticker or {}).get("bid")
@@ -537,19 +595,24 @@ def _extract_put_delta(market: dict, ticker: dict | None, spot: float, t_years: 
         ref_price = float(last)
 
     if ref_price and strike > 0 and t_years > 0:
-        iv = _implied_put_vol(ref_price, spot, strike, t_years)
-        return _bs_put_delta(spot, strike, t_years, iv)
+        iv = _implied_option_vol(option_type, ref_price, spot, strike, t_years)
+        return _bs_call_delta(spot, strike, t_years, iv) if is_call else _bs_put_delta(spot, strike, t_years, iv)
     return None
 
 
-def find_bull_put_spread_legs_by_delta(markets: dict, spot: float):
+def find_credit_spread_legs_by_delta(markets: dict, spot: float, spread_type: str):
+    is_bull_put = spread_type == "bull_put"
+    option_type = "put" if is_bull_put else "call"
+    target_short = TARGET_SHORT_PUT_DELTA if is_bull_put else TARGET_SHORT_CALL_DELTA
+    target_long = TARGET_LONG_PUT_DELTA if is_bull_put else TARGET_LONG_CALL_DELTA
+
     now_ms = int(time.time() * 1000)
     candidates_by_expiry = {}
 
     for symbol, m in markets.items():
         if not m.get("active") or m.get("type") != "option":
             continue
-        if m.get("base") != "BTC" or m.get("optionType") != "put":
+        if m.get("base") != "BTC" or m.get("optionType") != option_type:
             continue
         expiry_ms = m.get("expiry")
         if not expiry_ms or not m.get("strike"):
@@ -571,32 +634,42 @@ def find_bull_put_spread_legs_by_delta(markets: dict, spot: float):
         logging.warning(f"fetch_tickers failed ({e}); falling back to price IV estimate.")
         tickers = {}
 
-    scored_puts = []
+    scored = []
     for symbol, m, dte in expiry_contracts:
         t_years = max(dte, 1e-6) / 365.0
-        delta = _extract_put_delta(m, tickers.get(symbol), spot, t_years)
-        if delta is not None and -0.80 <= delta <= -0.02:
-            scored_puts.append({
+        delta = _extract_option_delta(option_type, m, tickers.get(symbol), spot, t_years)
+        if delta is None:
+            continue
+        valid_range = (-0.80 <= delta <= -0.02) if is_bull_put else (0.02 <= delta <= 0.80)
+        if valid_range:
+            scored.append({
                 **m,
                 "symbol": symbol,
                 "strike": float(m["strike"]),
                 "delta": delta,
             })
 
-    if len(scored_puts) < 2:
+    if len(scored) < 2:
         return None
 
-    short_leg = min(scored_puts, key=lambda x: abs(x["delta"] - TARGET_SHORT_PUT_DELTA))
-    long_leg = min(scored_puts, key=lambda x: abs(x["delta"] - TARGET_LONG_PUT_DELTA))
+    short_leg = min(scored, key=lambda x: abs(x["delta"] - target_short))
+    long_leg = min(scored, key=lambda x: abs(x["delta"] - target_long))
 
-    if abs(short_leg["delta"] - TARGET_SHORT_PUT_DELTA) > MAX_DELTA_DIFF:
+    if abs(short_leg["delta"] - target_short) > MAX_DELTA_DIFF:
         return None
-    if abs(long_leg["delta"] - TARGET_LONG_PUT_DELTA) > MAX_DELTA_DIFF:
-        return None
-    if short_leg["strike"] <= long_leg["strike"]:
+    if abs(long_leg["delta"] - target_long) > MAX_DELTA_DIFF:
         return None
 
-    return short_leg, long_leg, chosen_expiry
+    if is_bull_put:
+        if short_leg["strike"] <= long_leg["strike"]:
+            return None
+        width = short_leg["strike"] - long_leg["strike"]
+    else:
+        if short_leg["strike"] >= long_leg["strike"]:
+            return None
+        width = long_leg["strike"] - short_leg["strike"]
+
+    return short_leg, long_leg, chosen_expiry, width
 
 
 def check_spread_edge(short_sym: str, long_sym: str, strike_width: float):
@@ -608,14 +681,16 @@ def check_spread_edge(short_sym: str, long_sym: str, strike_width: float):
     short_bid = float(short_ob["bids"][0][0])
     long_ask = float(long_ob["asks"][0][0])
     net_credit = short_bid - long_ask
+    ratio = net_credit / strike_width if strike_width > 0 else 0.0
 
-    if net_credit <= 0 or (net_credit / strike_width) < MIN_CREDIT_RATIO:
+    if net_credit <= 0 or ratio < MIN_CREDIT_RATIO:
         return None
 
     return {
         "short_bid": short_bid,
         "long_ask": long_ask,
         "net_credit": net_credit,
+        "credit_ratio": ratio,
         "max_loss": strike_width - net_credit,
     }
 
@@ -908,8 +983,8 @@ def api_state():
         rem_ms = max(0, expiry_ms - now_ms)
         rem_pct = round(min(100.0, max(0.0, (rem_ms / total_dur_ms) * 100.0)), 1)
 
-        s_delta = _estimate_live_put_delta(trade, "short", now_ms)
-        l_delta = _estimate_live_put_delta(trade, "long", now_ms)
+        s_delta = _estimate_live_leg_delta(trade, "short", now_ms)
+        l_delta = _estimate_live_leg_delta(trade, "long", now_ms)
 
         live_trade = {
             **trade,
@@ -919,7 +994,6 @@ def api_state():
             "remaining_pct": rem_pct,
             "short_delta": round(s_delta, 3) if s_delta is not None else None,
             "long_delta": round(l_delta, 3) if l_delta is not None else None,
-            "net_delta": round(-(s_delta - l_delta), 3) if (s_delta is not None and l_delta is not None) else None,
         }
 
     formatted_history = [
@@ -936,6 +1010,7 @@ def api_state():
         "mode": "TESTNET" if USE_TESTNET else "LIVE",
         "paused": bool(state.get("paused", False)),
         "pin_interval_sec": int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)),
+        "last_scan": state.get("last_scan"),
         "active_trade": live_trade,
         "stats": stats,
         "trade_history": formatted_history,
@@ -1026,6 +1101,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .label { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .val { font-size: 1.4rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
   .pos { color: var(--green); } .neg { color: var(--red); }
+  .scan-row { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 0.88rem; align-items: center; }
+  .scan-reason { margin-top: 8px; font-size: 0.9rem; color: var(--amber); }
   .bar-bg { width: 100%; height: 10px; background: #1c2536; border-radius: 999px; overflow: hidden; margin-top: 10px; }
   .bar-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .4s ease; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
@@ -1044,7 +1121,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="wrap">
   <div class="topbar">
     <div class="title">
-      BTC Bull Put Credit Spread
+      BTC Dual-Regime Credit Spread
       <span id="modeBadge" class="badge badge-mode">TESTNET</span>
       <span id="statusBadge" class="badge badge-run">RUNNING</span>
     </div>
@@ -1061,18 +1138,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-bottom:16px;">
-    <div class="label">Active Spread Position</div>
-    <div id="noTradeMsg" style="margin-top:10px; color:var(--muted);">No active spread open. Scanning 1h trend &amp; option chain...</div>
+    <div class="label">Live Scanner Diagnostics</div>
+    <div class="scan-row">
+      <span>Spot: <b id="scanSpot">--</b></span>
+      <span>1h EMA-50: <b id="scanEma">--</b></span>
+      <span>Regime: <b id="scanRegime">--</b></span>
+      <span>Credit Ratio: <b id="scanRatio">--</b></span>
+      <span style="margin-left:auto; color:var(--muted);" id="scanTime">--</span>
+    </div>
+    <div id="scanReason" class="scan-reason">Waiting for first scan cycle...</div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px;">
+    <div class="label">Active Spread Position (<span id="activeSpreadType">--</span>)</div>
+    <div id="noTradeMsg" style="margin-top:10px; color:var(--muted);">No active spread open.</div>
     <div id="tradePanel" style="display:none;">
       <table>
         <thead><tr><th>Leg</th><th>Contract</th><th>Strike</th><th>Fill Price</th><th>Delta (Δ)</th></tr></thead>
         <tbody>
-          <tr><td><b>Short Put</b></td><td><code id="shortSym">--</code></td><td id="shortStrike">--</td><td id="shortFill">--</td><td id="shortDelta">--</td></tr>
-          <tr><td><b>Long Put (Hedge)</b></td><td><code id="longSym">--</code></td><td id="longStrike">--</td><td id="longFill">--</td><td id="longDelta">--</td></tr>
+          <tr><td><b>Short Leg</b></td><td><code id="shortSym">--</code></td><td id="shortStrike">--</td><td id="shortFill">--</td><td id="shortDelta">--</td></tr>
+          <tr><td><b>Long Leg (Hedge)</b></td><td><code id="longSym">--</code></td><td id="longStrike">--</td><td id="longFill">--</td><td id="longDelta">--</td></tr>
         </tbody>
       </table>
       <div style="display:flex; justify-content:space-between; margin-top:12px; font-size:0.85rem; color:var(--muted);">
-        <span>Entry Credit: <b id="entryCredit" style="color:var(--text);">--</b> | Net Δ: <b id="netDelta" style="color:var(--text);">--</b></span>
+        <span>Entry Credit: <b id="entryCredit" style="color:var(--text);">--</b></span>
         <span>Remaining Hold: <b id="hoursLeft" style="color:var(--text);">--</b>h (<span id="remPct">--</span>%)</span>
       </div>
       <div class="bar-bg"><div id="holdBar" class="bar-fill" style="width:0%;"></div></div>
@@ -1098,7 +1187,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="historyWrap" style="display:none; overflow-x:auto;">
       <table>
         <thead>
-          <tr><th>Entry → Exit (IST)</th><th>Strikes (S / L)</th><th>Deltas (S / L)</th><th>Reason</th><th>Realized PnL</th></tr>
+          <tr><th>Entry → Exit (IST)</th><th>Spread</th><th>Strikes (S / L)</th><th>Deltas (S / L)</th><th>Reason</th><th>Realized PnL</th></tr>
         </thead>
         <tbody id="historyBody"></tbody>
       </table>
@@ -1128,6 +1217,18 @@ async function fetchState() {
       tBtn.textContent = "Pause Bot"; tBtn.className = "btn-warn";
     }
 
+    const scan = data.last_scan;
+    if (scan) {
+      document.getElementById("scanSpot").textContent = scan.spot !== null && scan.spot !== undefined ? Number(scan.spot).toFixed(2) : "--";
+      document.getElementById("scanEma").textContent = scan.ema_50 !== null && scan.ema_50 !== undefined ? Number(scan.ema_50).toFixed(2) : "--";
+      document.getElementById("scanRegime").textContent = scan.spread_label || "--";
+      document.getElementById("scanRatio").textContent = scan.credit_ratio_pct !== null && scan.credit_ratio_pct !== undefined ? `${Number(scan.credit_ratio_pct).toFixed(2)}%` : "--";
+      document.getElementById("scanTime").textContent = scan.checked_at_ist || "--";
+      const rEl = document.getElementById("scanReason");
+      rEl.textContent = `[${scan.status || "INFO"}] ${scan.reason || ""}`;
+      rEl.style.color = scan.status === "OPENED" ? "var(--green)" : (scan.status === "ERROR" ? "var(--red)" : "var(--amber)");
+    }
+
     const stats = data.stats || {};
     const rPnl = Number(stats.realized_pnl || 0);
     const rEl = document.getElementById("realizedPnl");
@@ -1147,6 +1248,7 @@ async function fetchState() {
     const t = data.active_trade;
     const liveEl = document.getElementById("livePnl");
     if (t) {
+      document.getElementById("activeSpreadType").textContent = t.spread_label || "Credit Spread";
       document.getElementById("noTradeMsg").style.display = "none";
       document.getElementById("tradePanel").style.display = "block";
       document.getElementById("shortSym").textContent = t.short_sym;
@@ -1157,7 +1259,6 @@ async function fetchState() {
       document.getElementById("longFill").textContent = Number(t.long_fill_price || 0).toFixed(4);
       document.getElementById("shortDelta").textContent = t.short_delta !== null ? t.short_delta.toFixed(3) : "N/A";
       document.getElementById("longDelta").textContent = t.long_delta !== null ? t.long_delta.toFixed(3) : "N/A";
-      document.getElementById("netDelta").textContent = t.net_delta !== null ? t.net_delta.toFixed(3) : "N/A";
       document.getElementById("entryCredit").textContent = Number(t.entry_credit || 0).toFixed(4);
       document.getElementById("maxLoss").textContent = Number(t.max_loss || 0).toFixed(4);
       document.getElementById("hoursLeft").textContent = t.hours_left;
@@ -1172,6 +1273,7 @@ async function fetchState() {
         liveEl.textContent = "Quote N/A"; liveEl.className = "val";
       }
     } else {
+      document.getElementById("activeSpreadType").textContent = "Flat";
       document.getElementById("noTradeMsg").style.display = "block";
       document.getElementById("tradePanel").style.display = "none";
       liveEl.textContent = "Flat"; liveEl.className = "val";
@@ -1191,6 +1293,7 @@ async function fetchState() {
         const ldStr = (row.long_delta !== null && row.long_delta !== undefined) ? Number(row.long_delta).toFixed(3) : "N/A";
         return `<tr>
           <td><code>${row.entry_ist}</code> → <code>${row.exit_ist}</code></td>
+          <td>${row.spread_label || "Spread"}</td>
           <td><b>${row.short_strike ?? "--"}</b> / ${row.long_strike ?? "--"}</td>
           <td><code>${sdStr}</code> / <code>${ldStr}</code></td>
           <td>${row.exit_reason || "--"}</td>
@@ -1252,102 +1355,146 @@ def run_bot():
     state = load_state()
 
     send_telegram(
-        f"<b>Bull Put Spread Bot Started</b>\n"
+        f"<b>Bull/Bear Credit Spread Bot Started</b>\n"
         f"Mode: <code>{'TESTNET' if USE_TESTNET else 'LIVE'}</code> | "
         f"State: <code>{'PAUSED' if state['paused'] else 'RUNNING'}</code>\n"
-        f"Web UI: <code>http://{WEB_UI_HOST}:{WEB_UI_PORT}</code>"
+        f"Web UI Port: <code>{WEB_UI_PORT}</code>"
     )
     ensure_and_update_pinned_card(force_new=False)
-    logging.info("Bull Put Credit Spread Bot started.")
+    logging.info(f"Credit Spread Bot started on port {WEB_UI_PORT}.")
 
     while True:
         try:
             with state_lock:
                 state = load_state()
                 active_trade = state.get("active_trade")
+                paused = bool(state.get("paused", False))
                 now_ms = int(time.time() * 1000)
 
-                if active_trade:
-                    hours_to_exp = (int(active_trade["expiry_ms"]) - now_ms) / (1000 * 60 * 60)
-                    pnl, _ = get_unrealized_pnl(active_trade)
+            if active_trade:
+                hours_to_exp = (int(active_trade["expiry_ms"]) - now_ms) / (1000 * 60 * 60)
+                pnl, _ = get_unrealized_pnl(active_trade)
 
-                    tp_target = float(active_trade["entry_credit"]) * TAKE_PROFIT_PCT
-                    sl_limit = -float(active_trade["entry_credit"]) * STOP_LOSS_MULT
+                tp_target = float(active_trade["entry_credit"]) * TAKE_PROFIT_PCT
+                sl_limit = -float(active_trade["entry_credit"]) * STOP_LOSS_MULT
 
-                    exit_reason = None
-                    if pnl >= tp_target:
-                        exit_reason = "Take Profit (50% Max Credit)"
-                    elif pnl <= sl_limit:
-                        exit_reason = "Stop Loss (1.5x Credit)"
-                    elif hours_to_exp <= EXIT_HOURS_BEFORE_EXP:
-                        exit_reason = "Time Exit (Pre-Expiry Pin Protection)"
+                exit_reason = None
+                if pnl >= tp_target:
+                    exit_reason = "Take Profit (50% Max Credit)"
+                elif pnl <= sl_limit:
+                    exit_reason = "Stop Loss (1.5x Credit)"
+                elif hours_to_exp <= EXIT_HOURS_BEFORE_EXP:
+                    exit_reason = "Time Exit (Pre-Expiry Pin Protection)"
 
-                    if exit_reason:
-                        realized = close_spread(
-                            active_trade["short_sym"],
-                            active_trade["long_sym"],
-                            active_trade["entry_credit"],
-                        )
-                        update_stats(realized)
-                        record_closed_trade(active_trade, realized, exit_reason)
+                if exit_reason:
+                    realized = close_spread(
+                        active_trade["short_sym"],
+                        active_trade["long_sym"],
+                        active_trade["entry_credit"],
+                    )
+                    update_stats(realized)
+                    record_closed_trade(active_trade, realized, exit_reason)
+                    with state_lock:
+                        state = load_state()
                         state["active_trade"] = None
                         save_state(state)
 
-                        send_telegram(
-                            f"<b>Spread Closed — {exit_reason}</b>\n"
-                            f"Short: <code>{active_trade['short_sym']}</code>\n"
-                            f"Long: <code>{active_trade['long_sym']}</code>\n"
-                            f"Realized PnL: <code>{realized:+.4f}</code>"
+                    send_telegram(
+                        f"<b>Spread Closed — {exit_reason}</b>\n"
+                        f"Short: <code>{active_trade['short_sym']}</code>\n"
+                        f"Long: <code>{active_trade['long_sym']}</code>\n"
+                        f"Realized PnL: <code>{realized:+.4f}</code>"
+                    )
+                    ensure_and_update_pinned_card(force_new=False)
+                else:
+                    logging.info(
+                        f"Monitoring {active_trade['short_sym']} | "
+                        f"PnL: {pnl:+.4f} | Exp: {hours_to_exp:.1f}h"
+                    )
+
+            elif paused:
+                msg = "Bot is currently PAUSED; skipping new entries."
+                logging.info(f"[SCAN] {msg}")
+                record_scan_diagnostics("PAUSED", msg)
+
+            else:
+                spot, ema_50 = get_spot_and_ema(50)
+                spread_type = "bull_put" if spot > ema_50 else "bear_call"
+                spread_label = "Bull Put Spread" if spread_type == "bull_put" else "Bear Call Spread"
+
+                legs = find_credit_spread_legs_by_delta(markets, spot, spread_type)
+                if not legs:
+                    msg = f"No {spread_label} pair matched DTE ({MIN_DTE}-{MAX_DTE}d) & Delta targets."
+                    logging.info(f"[SCAN] Spot={spot:.2f}, EMA50={ema_50:.2f} | {msg}")
+                    record_scan_diagnostics("SKIPPED", msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label)
+                else:
+                    short_leg, long_leg, expiry_ms, width = legs
+                    quote = check_spread_edge(short_leg["symbol"], long_leg["symbol"], width)
+                    if not quote:
+                        msg = (
+                            f"Rejected {short_leg['symbol']} (Δ {short_leg['delta']:+.3f}) / "
+                            f"{long_leg['symbol']} (Δ {long_leg['delta']:+.3f}) due to bid/ask or credit < {MIN_CREDIT_RATIO*100:.0f}%."
                         )
-                        ensure_and_update_pinned_card(force_new=False)
+                        logging.info(f"[SCAN] {msg}")
+                        record_scan_diagnostics("SKIPPED", msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label)
                     else:
-                        logging.info(
-                            f"Monitoring {active_trade['short_sym']} | "
-                            f"PnL: {pnl:+.4f} | Exp: {hours_to_exp:.1f}h"
-                        )
+                        ratio = quote["credit_ratio"]
+                        msg = f"Valid {spread_label} setup! Credit={quote['net_credit']:.4f} ({ratio*100:.2f}% of width)."
+                        logging.info(f"[SCAN] {msg}")
+                        record_scan_diagnostics("EXECUTING", msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label, credit_ratio=ratio)
 
-                elif not state.get("paused"):
-                    spot, ema_50 = get_spot_and_ema(50)
-                    if spot > ema_50:
-                        legs = find_bull_put_spread_legs_by_delta(markets, spot)
-                        if legs:
-                            short_leg, long_leg, expiry_ms = legs
-                            width = float(short_leg["strike"]) - float(long_leg["strike"])
-                            quote = check_spread_edge(short_leg["symbol"], long_leg["symbol"], width)
-                            if quote:
-                                fills = open_spread(short_leg["symbol"], long_leg["symbol"], quote)
-                                if fills:
-                                    actual_credit = float(fills["actual_credit"])
-                                    actual_max_loss = width - actual_credit
-                                    new_trade = {
-                                        "short_sym": short_leg["symbol"],
-                                        "long_sym": long_leg["symbol"],
-                                        "short_strike": short_leg["strike"],
-                                        "long_strike": long_leg["strike"],
-                                        "short_delta": short_leg["delta"],
-                                        "long_delta": long_leg["delta"],
-                                        "short_fill_price": fills["short_fill_price"],
-                                        "long_fill_price": fills["long_fill_price"],
-                                        "entry_credit": actual_credit,
-                                        "max_loss": actual_max_loss,
-                                        "expiry_ms": expiry_ms,
-                                        "opened_at": datetime.now(timezone.utc).isoformat(),
-                                    }
-                                    state["active_trade"] = new_trade
-                                    save_state(state)
+                        fills = open_spread(short_leg["symbol"], long_leg["symbol"], quote)
+                        if not fills:
+                            fail_msg = "Leg fill/chase incomplete; aborted cleanly with no open position."
+                            logging.warning(f"[SCAN] {fail_msg}")
+                            record_scan_diagnostics("SKIPPED", fail_msg, spot=spot, ema_50=ema_50, spread_type=spread_type, spread_label=spread_label, credit_ratio=ratio)
+                        else:
+                            actual_credit = float(fills["actual_credit"])
+                            actual_max_loss = width - actual_credit
+                            new_trade = {
+                                "spread_type": spread_type,
+                                "spread_label": spread_label,
+                                "short_sym": short_leg["symbol"],
+                                "long_sym": long_leg["symbol"],
+                                "short_strike": short_leg["strike"],
+                                "long_strike": long_leg["strike"],
+                                "short_delta": short_leg["delta"],
+                                "long_delta": long_leg["delta"],
+                                "short_fill_price": fills["short_fill_price"],
+                                "long_fill_price": fills["long_fill_price"],
+                                "entry_credit": actual_credit,
+                                "max_loss": actual_max_loss,
+                                "expiry_ms": expiry_ms,
+                                "opened_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            with state_lock:
+                                state = load_state()
+                                state["active_trade"] = new_trade
+                                state["last_scan"] = {
+                                    "checked_at_ist": datetime.now(IST).strftime("%d %b %H:%M:%S IST"),
+                                    "status": "OPENED",
+                                    "reason": f"Opened {spread_label} ({short_leg['strike']} / {long_leg['strike']}).",
+                                    "spot": round(spot, 2),
+                                    "ema_50": round(ema_50, 2),
+                                    "spread_type": spread_type,
+                                    "spread_label": spread_label,
+                                    "credit_ratio_pct": round(ratio * 100.0, 2),
+                                }
+                                save_state(state)
 
-                                    send_telegram(
-                                        f"<b>New Bull Put Spread Opened</b>\n"
-                                        f"Spot: <code>{spot:.2f}</code> (EMA50: <code>{ema_50:.2f}</code>)\n"
-                                        f"Short Put: <code>{short_leg['strike']}</code> (Δ <code>{short_leg['delta']:+.3f}</code>)\n"
-                                        f"Long Put:  <code>{long_leg['strike']}</code> (Δ <code>{long_leg['delta']:+.3f}</code>)\n"
-                                        f"Actual Credit: <code>{actual_credit:.4f}</code>\n"
-                                        f"Max Loss Cap: <code>{actual_max_loss:.4f}</code>"
-                                    )
-                                    ensure_and_update_pinned_card(force_new=False)
+                            send_telegram(
+                                f"<b>New {spread_label} Opened</b>\n"
+                                f"Spot: <code>{spot:.2f}</code> (EMA50: <code>{ema_50:.2f}</code>)\n"
+                                f"Short: <code>{short_leg['strike']}</code> (Δ <code>{short_leg['delta']:+.3f}</code>)\n"
+                                f"Long:  <code>{long_leg['strike']}</code> (Δ <code>{long_leg['delta']:+.3f}</code>)\n"
+                                f"Actual Credit: <code>{actual_credit:.4f}</code>\n"
+                                f"Max Loss Cap: <code>{actual_max_loss:.4f}</code>"
+                            )
+                            ensure_and_update_pinned_card(force_new=False)
 
         except Exception as e:
             logging.error(f"Main loop error: {e}")
+            record_scan_diagnostics("ERROR", str(e))
             send_telegram(f"<b>Bot Loop Error:</b> <code>{e}</code>")
 
         time.sleep(POLL_INTERVAL_SEC)
