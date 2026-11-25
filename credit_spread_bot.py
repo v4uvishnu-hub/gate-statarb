@@ -30,7 +30,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
-WEB_UI_PORT = int(os.getenv("WEB_UI_PORT", "8080"))
+WEB_UI_PORT = int(os.getenv("PORT") or os.getenv("WEB_UI_PORT") or "8080")
 WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "")
 
 UNDERLYING = "BTC/USDT"
@@ -193,18 +193,22 @@ def _tg_api(method: str, payload: dict):
     return None
 
 
-def send_telegram(text: str):
-    if not _tg_configured():
+def send_telegram_to(chat_id: str, text: str):
+    if not _tg_configured() or not chat_id:
         return
     _tg_api(
         "sendMessage",
         {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         },
     )
+
+
+def send_telegram(text: str):
+    send_telegram_to(str(TELEGRAM_CHAT_ID), text)
 
 
 def get_unrealized_pnl(trade: dict) -> tuple[float, float]:
@@ -379,10 +383,17 @@ def telegram_command_worker():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = (msg.get("text") or "").strip()
 
-                if chat_id != str(TELEGRAM_CHAT_ID) or not text.startswith("/"):
+                if not chat_id or not text.startswith("/"):
                     continue
 
                 cmd = text.split()[0].lower()
+
+                if cmd == "/chatid":
+                    send_telegram_to(chat_id, f"Chat ID: <code>{chat_id}</code>")
+                    continue
+
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
 
                 if cmd == "/status":
                     with state_lock:
@@ -814,7 +825,7 @@ def close_spread(short_sym: str, long_sym: str, entry_credit: float) -> float:
 
 
 # ==========================================
-# FASTAPI WEB UI
+# FASTAPI WEB UI & HEALTHZ
 # ==========================================
 app = FastAPI(title="BTC Credit Spread Bot Dashboard")
 
@@ -838,6 +849,34 @@ def _fmt_ist(iso_str: str | None) -> str:
         return dt.astimezone(IST).strftime("%d %b %H:%M:%S")
     except Exception:
         return str(iso_str)
+
+
+@app.get("/healthz")
+def healthz():
+    redis_ok = False
+    try:
+        redis_ok = bool(rds.ping())
+    except Exception:
+        redis_ok = False
+
+    with state_lock:
+        try:
+            state = load_state()
+            paused = bool(state.get("paused", False))
+            has_trade = state.get("active_trade") is not None
+        except Exception:
+            paused = False
+            has_trade = False
+
+    return {
+        "status": "ok" if redis_ok else "degraded",
+        "redis": redis_ok,
+        "mode": "TESTNET" if USE_TESTNET else "LIVE",
+        "port": WEB_UI_PORT,
+        "paused": paused,
+        "has_active_trade": has_trade,
+        "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
 
 
 @app.get("/api/state")
