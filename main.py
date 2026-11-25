@@ -89,8 +89,8 @@ def get_env_config_defaults() -> Dict[str, Any]:
         "DRY_RUN": env_bool("DRY_RUN", True),
         "TRADE_ALERTS": env_bool("TRADE_ALERTS", True),
         "MAX_DAILY_LOSS_USDT": max(0.0, min(100000.0, env_float("MAX_DAILY_LOSS_USDT", 50.0))),
-        "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 35))),
-        "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 80))),
+        "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 25))),
+        "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 60))),
         "MAX_POSITIONS": max(1, min(10, env_int("MAX_POSITIONS", 3))),
         "MAX_HOLD_MINUTES": max(15, min(4320, env_int("MAX_HOLD_MINUTES", 720))),
         "NOTIONAL_USDT": max(10.0, min(10000.0, env_float("NOTIONAL_USDT", 100.0))),
@@ -105,8 +105,8 @@ SCAN_INTERVAL_SEC = max(15, env_int("SCAN_INTERVAL_SEC", 60))
 TG_PIN_REFRESH_SEC = max(20, env_int("TG_PIN_REFRESH_SEC", 60))
 INITIAL_EQUITY = max(50.0, env_float("INITIAL_EQUITY", 1000.0))
 TAKER_FEE = max(0.0, env_float("TAKER_FEE", 0.0005))
-FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 12)))
-CANDIDATE_POOL_LIMIT = max(10, min(80, env_int("CANDIDATE_POOL_LIMIT", 25)))
+FETCH_CONCURRENCY = max(4, min(30, env_int("FETCH_CONCURRENCY", 8)))
+CANDIDATE_POOL_LIMIT = max(10, min(80, env_int("CANDIDATE_POOL_LIMIT", 18)))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
@@ -268,7 +268,7 @@ class GateClient:
 
     async def public_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{GATE_BASE}{path}"
-        async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
             text = await resp.text()
             if resp.status >= 400:
                 raise RuntimeError(f"Gate GET {path} {resp.status}: {text[:180]}")
@@ -293,7 +293,7 @@ class GateClient:
         }
         url = f"{GATE_BASE}{path}" + (f"?{query_string}" if query_string else "")
         async with self.session.get(
-            url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
         ) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -321,7 +321,7 @@ class GateClient:
         }
         url = f"{GATE_BASE}{path}"
         async with self.session.post(
-            url, data=payload_str, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            url, data=payload_str, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
         ) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -476,9 +476,9 @@ def evaluate_pair(
     notional = float(cfg["NOTIONAL_USDT"])
 
     is_coint = (
-        adf <= -2.35
-        and 1.0 < hl <= 120.0
-        and corr >= 0.45
+        adf <= -2.55
+        and 3.0 <= hl <= 75.0
+        and corr >= 0.55
         and 0.15 <= abs_beta <= 5.0
     )
 
@@ -808,23 +808,26 @@ class StatArbBot:
         selected = [c for c, _ in ranked[:top_n]]
 
         sem = asyncio.Semaphore(FETCH_CONCURRENCY)
-        full_limit = max(90, lookback + 20)
+        full_limit = max(75, lookback + 15)
 
         async def fetch_one(contract: str) -> None:
             prev = self.store.candle_cache.get(contract, [])
-            limit = 12 if len(prev) >= lookback else full_limit
-            async with sem:
-                raw = await self.gate.public_get(
-                    "/futures/usdt/candlesticks",
-                    {"contract": contract, "interval": CANDLE_INTERVAL, "limit": limit},
-                )
+            limit = 10 if len(prev) >= lookback else full_limit
+            try:
+                async with sem:
+                    raw = await self.gate.public_get(
+                        "/futures/usdt/candlesticks",
+                        {"contract": contract, "interval": CANDLE_INTERVAL, "limit": limit},
+                    )
+            except Exception:
+                return
             merged: Dict[int, float] = dict(prev)
             for bar in raw if isinstance(raw, list) else []:
                 ts = int(bar.get("t") or 0)
                 close = float(bar.get("c") or 0.0)
                 if ts > 0 and close > 0:
                     merged[ts] = close
-            ordered = sorted(merged.items(), key=lambda x: x[0])[-(lookback + 25) :]
+            ordered = sorted(merged.items(), key=lambda x: x[0])[-(lookback + 20) :]
             if ordered:
                 self.store.candle_cache[contract] = ordered
 
@@ -959,8 +962,8 @@ class StatArbBot:
         except Exception as exc:
             async with self.store.lock:
                 self.store.state["last_tick_ts"] = now_ms()
-                self.store.state["last_error"] = str(exc)
-                self.store.add_event("ERROR", f"Market fetch failed: {exc}")
+                self.store.state["last_error"] = repr(exc)
+                self.store.add_event("ERROR", f"Market fetch failed: {exc!r}")
                 await self.store.save()
             return
 
@@ -1085,6 +1088,7 @@ class StatArbBot:
 
             valid_syms = [s for s in universe if len(self.store.candle_cache.get(s, [])) >= 35][:CANDIDATE_POOL_LIMIT]
             candidates: List[Dict[str, Any]] = []
+            pair_checks = 0
             for i in range(len(valid_syms)):
                 for j in range(i + 1, len(valid_syms)):
                     a, b = valid_syms[i], valid_syms[j]
@@ -1094,9 +1098,12 @@ class StatArbBot:
                     ev_ba = evaluate_pair(b, a, self.store.candle_cache[b], self.store.candle_cache[a], cfg)
                     if ev_ba:
                         candidates.append(ev_ba)
+                    pair_checks += 1
+                    if pair_checks % 40 == 0:
+                        await asyncio.sleep(0)
 
             candidates.sort(key=lambda x: x["score"], reverse=True)
-            state["ranked_pairs"] = candidates[:50]
+            state["ranked_pairs"] = candidates[:40]
 
             daily_loss_hit = (
                 max_daily_loss > 0.0
@@ -1439,7 +1446,7 @@ class StatArbBot:
 
             elif cmd == "/settopn":
                 if not arg1:
-                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–200). Example: <code>/settopn 35</code>"
+                    reply = f"Current <code>TOP_N_COINS</code>: <code>{cfg['TOP_N_COINS']}</code> (range 10–200). Example: <code>/settopn 25</code>"
                 else:
                     try:
                         val = int(arg1)
@@ -1450,11 +1457,11 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>TOP_N_COINS</code> updated to <code>{val}</code>."
                     except ValueError:
-                        reply = f"Enter a whole number from 10 to 200 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 35</code>"
+                        reply = f"Enter a whole number from 10 to 200 (current: <code>{cfg['TOP_N_COINS']}</code>). Example: <code>/settopn 25</code>"
 
             elif cmd == "/setlookback":
                 if not arg1:
-                    reply = f"Current <code>LOOKBACK</code>: <code>{cfg['LOOKBACK']}</code> bars (range 30–300). Example: <code>/setlookback 80</code>"
+                    reply = f"Current <code>LOOKBACK</code>: <code>{cfg['LOOKBACK']}</code> bars (range 30–300). Example: <code>/setlookback 60</code>"
                 else:
                     try:
                         val = int(arg1)
@@ -1465,7 +1472,7 @@ class StatArbBot:
                         await self.store.save()
                         reply = f"✅ <code>LOOKBACK</code> updated to <code>{val}</code> bars."
                     except ValueError:
-                        reply = f"Enter a whole number from 30 to 300 (current: <code>{cfg['LOOKBACK']}</code>). Example: <code>/setlookback 80</code>"
+                        reply = f"Enter a whole number from 30 to 300 (current: <code>{cfg['LOOKBACK']}</code>). Example: <code>/setlookback 60</code>"
 
             elif cmd == "/setmaxpos":
                 if not arg1:
@@ -1602,7 +1609,7 @@ class StatArbBot:
                     "allowed_updates": json.dumps(["message", "callback_query"]),
                 }
                 async with self.session.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=35)
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=32)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -1615,6 +1622,8 @@ class StatArbBot:
                         await asyncio.sleep(3)
             except asyncio.CancelledError:
                 break
+            except asyncio.TimeoutError:
+                continue
             except Exception as exc:
                 log.warning("Telegram poll error: %r", exc)
                 await asyncio.sleep(3)
@@ -1803,8 +1812,8 @@ function renderState(s) {
   document.getElementById("modeLine").textContent =
     (s.paused ? "PAUSED" : "RUNNING") +
     " | Mode: " + (cfg.DRY_RUN ? "PAPER" : "LIVE") +
-    " | Top-" + (cfg.TOP_N_COINS || 35) +
-    " | Lookback: " + (cfg.LOOKBACK || 80) +
+    " | Top-" + (cfg.TOP_N_COINS || 25) +
+    " | Lookback: " + (cfg.LOOKBACK || 60) +
     " | Z (In/Out/Stop): " + cfg.Z_ENTRY + "/" + cfg.Z_EXIT + "/" + cfg.Z_STOP +
     " | Notional: $" + cfg.NOTIONAL_USDT +
     " | Daily Cap: $" + (cfg.MAX_DAILY_LOSS_USDT ?? 50) +
@@ -1964,7 +1973,7 @@ fetchState();
 
 
 async def main() -> None:
-    connector = aiohttp.TCPConnector(limit=30, keepalive_timeout=20)
+    connector = aiohttp.TCPConnector(limit=24, keepalive_timeout=15)
     session = aiohttp.ClientSession(connector=connector)
     store = StateStore()
     await store.init()
@@ -1973,6 +1982,9 @@ async def main() -> None:
 
     async def handle_index(_request: web.Request) -> web.Response:
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+    async def handle_favicon(_request: web.Request) -> web.Response:
+        return web.Response(status=204)
 
     async def handle_state(_request: web.Request) -> web.Response:
         return web.Response(text=store.state_json_cache, content_type="application/json")
@@ -1998,6 +2010,7 @@ async def main() -> None:
 
     app = web.Application()
     app.router.add_get("/", handle_index)
+    app.router.add_get("/favicon.ico", handle_favicon)
     app.router.add_get("/api/state", handle_state)
     app.router.add_post("/api/control", handle_control)
     app.router.add_get("/health", handle_health)
