@@ -47,6 +47,7 @@ HELP_TEXT_HTML = (
     "/setalerts - Mute or unmute trade alerts (on or off)\n"
     "/setdryrun - Toggle paper (true) or live (false confirm)\n"
     "/setdailyloss - Set max daily loss USDT guard (0 = off)\n"
+    "/setcooldown - Set post-close pair cooldown min (0-1440)\n"
     "/setpinsec - Set synced Web UI &amp; pin refresh sec (3-3600)\n"
     "/settopn - Set TOP_N_COINS universe size (10-200)\n"
     "/setlookback - Set LOOKBACK candle window (30-300)\n"
@@ -91,6 +92,7 @@ def get_env_config_defaults() -> Dict[str, Any]:
         "DRY_RUN": env_bool("DRY_RUN", True),
         "TRADE_ALERTS": env_bool("TRADE_ALERTS", True),
         "TG_PIN_REFRESH_SEC": max(3, min(3600, env_int("TG_PIN_REFRESH_SEC", 60))),
+        "PAIR_COOLDOWN_MINUTES": max(0.0, min(1440.0, env_float("PAIR_COOLDOWN_MINUTES", 30.0))),
         "MAX_DAILY_LOSS_USDT": max(0.0, min(100000.0, env_float("MAX_DAILY_LOSS_USDT", 50.0))),
         "TOP_N_COINS": max(10, min(200, env_int("TOP_N_COINS", 25))),
         "LOOKBACK": max(30, min(300, env_int("LOOKBACK", 60))),
@@ -179,6 +181,7 @@ class StateStore:
             "wins": 0,
             "losses": 0,
             "positions": [],
+            "pair_cooldowns": {},
             "ranked_pairs": [],
             "trades": [],
             "pinned_chat_id": None,
@@ -209,6 +212,16 @@ class StateStore:
             self.state["wins"] = int(self.state.get("wins", 0)) + 1
         else:
             self.state["losses"] = int(self.state.get("losses", 0)) + 1
+
+    def prune_cooldowns(self, ts_ms: Optional[int] = None) -> None:
+        now = now_ms() if ts_ms is None else ts_ms
+        cds = self.state.get("pair_cooldowns")
+        if not isinstance(cds, dict):
+            self.state["pair_cooldowns"] = {}
+            return
+        self.state["pair_cooldowns"] = {
+            k: int(v) for k, v in cds.items() if float(v or 0) > now
+        }
 
     async def init(self) -> None:
         if REDIS_URL:
@@ -253,12 +266,14 @@ class StateStore:
             base.update(loaded)
             base["config"] = merged_cfg
             base["positions"] = loaded.get("positions") if isinstance(loaded.get("positions"), list) else []
+            base["pair_cooldowns"] = loaded.get("pair_cooldowns") if isinstance(loaded.get("pair_cooldowns"), dict) else {}
             base["ranked_pairs"] = loaded.get("ranked_pairs") if isinstance(loaded.get("ranked_pairs"), list) else []
             base["trades"] = loaded.get("trades") if isinstance(loaded.get("trades"), list) else []
             base["events"] = loaded.get("events") if isinstance(loaded.get("events"), list) else base["events"]
             self.state = base
 
         self.roll_daily_pnl_if_needed()
+        self.prune_cooldowns()
         self.state_json_cache = json.dumps(self.state, separators=(",", ":"))
         await self.save()
 
@@ -506,7 +521,7 @@ def evaluate_pair(
         adf <= -2.55
         and 3.0 <= hl <= 75.0
         and corr >= 0.55
-        and 0.15 <= abs_beta <= 5.0
+        and 0.25 <= abs_beta <= 2.5
     )
 
     if z_now <= -z_entry:
@@ -524,7 +539,11 @@ def evaluate_pair(
     edge_usdt = expected_gross_usdt - fee_drag_usdt
     edge_pct = (edge_usdt / total_notional * 100.0) if total_notional > 0 else 0.0
 
-    status = "ENTRY MET" if (is_coint and signal != "NONE" and edge_usdt > 0) else ("COINT" if is_coint else "WATCH")
+    status = (
+        "ENTRY MET"
+        if (is_coint and signal != "NONE" and edge_usdt > 0.05)
+        else ("COINT" if is_coint else "WATCH")
+    )
 
     score = (
         (50.0 if is_coint else 0.0)
@@ -568,6 +587,16 @@ class StatArbBot:
             return max(3, min(3600, int(float(raw))))
         except (ValueError, TypeError):
             return TG_PIN_REFRESH_SEC
+
+    def _apply_pair_cooldown(self, pair: str, cfg: Dict[str, Any], exit_ts_ms: int) -> None:
+        cooldown_min = max(0.0, float(cfg.get("PAIR_COOLDOWN_MINUTES", 30.0)))
+        if cooldown_min <= 0.0:
+            return
+        cds = self.store.state.get("pair_cooldowns")
+        if not isinstance(cds, dict):
+            cds = {}
+            self.store.state["pair_cooldowns"] = cds
+        cds[pair] = exit_ts_ms + int(cooldown_min * 60000.0)
 
     async def send_telegram(
         self,
@@ -638,6 +667,7 @@ class StatArbBot:
     async def send_startup_notification(self) -> None:
         async with self.store.lock:
             self.store.roll_daily_pnl_if_needed()
+            self.store.prune_cooldowns()
             state = self.store.state
             cfg = state.get("config", {})
             mode = "PAPER (DRY_RUN)" if cfg.get("DRY_RUN", True) else "LIVE TRADING"
@@ -971,6 +1001,7 @@ class StatArbBot:
                 pnl = float(pos.get("unrealizedPnl") or 0.0)
                 total_pnl += pnl
                 self.store.record_realized_pnl(pnl, ts_exit)
+                self._apply_pair_cooldown(str(pos["pair"]), cfg, ts_exit)
 
                 state["trades"] = [
                     {
@@ -998,6 +1029,7 @@ class StatArbBot:
                 )
 
             state["positions"] = []
+            self.store.prune_cooldowns(ts_exit)
             await self.store.save()
             alerts.append(
                 f"🛑 <b>Closed All Positions</b> (<code>{html.escape(reason)}</code>)\n"
@@ -1013,6 +1045,7 @@ class StatArbBot:
         alerts: List[str] = []
         async with self.store.lock:
             self.store.roll_daily_pnl_if_needed()
+            self.store.prune_cooldowns()
             cfg = dict(self.store.state["config"])
 
         try:
@@ -1028,6 +1061,7 @@ class StatArbBot:
 
         async with self.store.lock:
             self.store.roll_daily_pnl_if_needed()
+            self.store.prune_cooldowns()
             state = self.store.state
             cfg = state["config"]
             state["last_tick_ts"] = now_ms()
@@ -1110,6 +1144,7 @@ class StatArbBot:
                         self.store.add_event("ERROR", f"Live exit failed {pos['pair']}: {exc}")
 
                     self.store.record_realized_pnl(net_pnl, now)
+                    self._apply_pair_cooldown(str(pos["pair"]), cfg, now)
 
                     state["trades"] = [
                         {
@@ -1174,6 +1209,7 @@ class StatArbBot:
                 for p in state["positions"]:
                     busy.add(p["legY"])
                     busy.add(p["legX"])
+                cooldowns = state.get("pair_cooldowns") or {}
 
                 for cand in candidates:
                     if len(state["positions"]) >= max_positions:
@@ -1181,6 +1217,8 @@ class StatArbBot:
                     if cand["status"] != "ENTRY MET" or cand["signal"] == "NONE":
                         continue
                     if cand["legY"] in busy or cand["legX"] in busy:
+                        continue
+                    if float(cooldowns.get(cand["pair"], 0)) > now_ms():
                         continue
 
                     notional_y = notional_usdt
@@ -1356,6 +1394,7 @@ class StatArbBot:
 
         async with self.store.lock:
             self.store.roll_daily_pnl_if_needed()
+            self.store.prune_cooldowns()
             state = self.store.state
             cfg = state["config"]
             defaults = get_env_config_defaults()
@@ -1366,10 +1405,11 @@ class StatArbBot:
                 alerts_state = "ON" if cfg.get("TRADE_ALERTS", True) else "OFF"
                 d_pnl = float(state.get("daily_realized_pnl", 0.0))
                 pin_sec = self.get_pin_refresh_sec()
+                cd_min = cfg.get("PAIR_COOLDOWN_MINUTES", 30.0)
                 reply = (
                     f"<b>Status:</b> {'⏸ PAUSED' if state.get('paused') else '▶️ RUNNING'} | <b>{mode}</b> | Alerts: <code>{alerts_state}</code>\n"
                     f"<b>Positions:</b> <code>{len(state.get('positions', []))}/{cfg['MAX_POSITIONS']}</code> | "
-                    f"<b>Sync Refresh:</b> <code>{pin_sec}s</code> | "
+                    f"<b>Sync Refresh:</b> <code>{pin_sec}s</code> | <b>Cooldown:</b> <code>{cd_min}m</code>\n"
                     f"<b>Z Entry/Exit/Stop:</b> <code>{cfg['Z_ENTRY']}/{cfg['Z_EXIT']}/{cfg['Z_STOP']}</code>\n"
                     f"<b>Daily Realized:</b> <code>{d_pnl:+.5f} USDT</code> (Cap: <code>{cfg['MAX_DAILY_LOSS_USDT']}</code>) | "
                     f"<b>Open PnL:</b> <code>{u_pnl:+.5f} USDT</code>\n"
@@ -1412,6 +1452,7 @@ class StatArbBot:
                     "DRY_RUN",
                     "TRADE_ALERTS",
                     "TG_PIN_REFRESH_SEC",
+                    "PAIR_COOLDOWN_MINUTES",
                     "MAX_DAILY_LOSS_USDT",
                     "TOP_N_COINS",
                     "LOOKBACK",
@@ -1466,6 +1507,25 @@ class StatArbBot:
                         reply = "🔇 Trade alerts set to <b>OFF</b> (bot keeps running; direct commands still reply)."
                     else:
                         reply = "Send <code>/setalerts on</code> or <code>/setalerts off</code>."
+
+            elif cmd == "/setcooldown":
+                cur_cd = cfg.get("PAIR_COOLDOWN_MINUTES", 30.0)
+                if not arg1:
+                    reply = (
+                        f"Current <code>PAIR_COOLDOWN_MINUTES</code>: <code>{cur_cd}</code>m (range 0–1440). "
+                        f"Example: <code>/setcooldown 30</code>"
+                    )
+                else:
+                    try:
+                        val = float(arg1)
+                        if not (0.0 <= val <= 1440.0):
+                            raise ValueError
+                        cfg["PAIR_COOLDOWN_MINUTES"] = round(val, 2)
+                        self.store.add_event("CONFIG", f"PAIR_COOLDOWN_MINUTES updated to {cfg['PAIR_COOLDOWN_MINUTES']}m")
+                        await self.store.save()
+                        reply = f"✅ <code>PAIR_COOLDOWN_MINUTES</code> updated to <code>{cfg['PAIR_COOLDOWN_MINUTES']}</code>m."
+                    except ValueError:
+                        reply = f"Enter minutes from 0 to 1440 (current: <code>{cur_cd}</code>m). Example: <code>/setcooldown 30</code>"
 
             elif cmd == "/setpinsec":
                 cur_sec = self.get_pin_refresh_sec()
@@ -1914,6 +1974,7 @@ function renderState(s) {
     (s.paused ? "PAUSED" : "RUNNING") +
     " | Mode: " + (cfg.DRY_RUN ? "PAPER" : "LIVE") +
     " | Sync: " + refreshIntervalSec + "s" +
+    " | Cooldown: " + (cfg.PAIR_COOLDOWN_MINUTES ?? 30) + "m" +
     " | Top-" + (cfg.TOP_N_COINS || 25) +
     " | Lookback: " + (cfg.LOOKBACK || 60) +
     " | Z (In/Out/Stop): " + cfg.Z_ENTRY + "/" + cfg.Z_EXIT + "/" + cfg.Z_STOP +
