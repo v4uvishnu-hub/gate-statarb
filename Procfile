@@ -1,1 +1,1 @@
-web: python credit_spread_bot.py
+web: python atr_trend_bot.py
