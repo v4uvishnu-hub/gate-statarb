@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import time
 import logging
 import threading
@@ -21,9 +20,9 @@ API_SECRET = os.getenv("GATE_API_SECRET", "YOUR_GATE_API_SECRET")
 USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-REDIS_STATE_KEY = "spread_bot:state"
-REDIS_STATS_KEY = "spread_bot:stats"
-REDIS_HISTORY_KEY = "spread_bot:history"
+REDIS_STATE_KEY = "atr_trend_bot:state"
+REDIS_STATS_KEY = "atr_trend_bot:stats"
+REDIS_HISTORY_KEY = "atr_trend_bot:history"
 MAX_TRADE_HISTORY = 100
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
@@ -33,31 +32,36 @@ WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("PORT") or os.getenv("WEB_UI_PORT") or "8080")
 WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "")
 
-UNDERLYING = "BTC/USDT"
-CONTRACTS = float(os.getenv("CONTRACTS", "1"))
-MIN_DTE = 3
-MAX_DTE = 7
-MIN_CREDIT_RATIO = 0.05
+# Universe, Rotation & Concurrent Position Settings
+TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
+MAX_PAIRS_PER_CYCLE = int(os.getenv("MAX_PAIRS_PER_CYCLE", "25"))
+UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "1800"))
 
-TARGET_SHORT_PUT_DELTA = -0.25
-TARGET_LONG_PUT_DELTA = -0.10
-TARGET_SHORT_CALL_DELTA = 0.25
-TARGET_LONG_CALL_DELTA = 0.10
-MAX_DELTA_DIFF = 0.08
-RISK_FREE_RATE = 0.0
+raw_pinned = (
+    os.getenv("PINNED_SYMBOLS")
+    or os.getenv("TRADE_SYMBOLS")
+    or os.getenv("TRADE_SYMBOL")
+    or "BTC/USDT:USDT,ETH/USDT:USDT"
+)
+PINNED_SYMBOLS = [s.strip() for s in raw_pinned.split(",") if s.strip()]
 
-LEG_FILL_TIMEOUT_SEC = 15
-LEG_POLL_INTERVAL_SEC = 0.5
-MAX_CHASE_STEPS = 3
-MAX_SLIPPAGE_PCT = 0.015
-UNWIND_TIMEOUT_SEC = 10
-QTY_EPSILON = 1e-8
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 
-TAKE_PROFIT_PCT = 0.50
-STOP_LOSS_MULT = 1.50
-EXIT_HOURS_BEFORE_EXP = 12
+# Strategy Parameters (1h EMA trend + 15m ATR pullback/continuation)
+TREND_TF = "1h"
+ENTRY_TF = "15m"
+EMA_FAST_LEN = 20
+EMA_SLOW_LEN = 50
+ATR_LEN = 14
+
+RISK_PER_TRADE_USDT = float(os.getenv("RISK_PER_TRADE_USDT", "25.0"))
+STOP_ATR_MULT = float(os.getenv("STOP_ATR_MULT", "1.5"))
+TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "2.0"))
+TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
+PULLBACK_ATR_BAND = float(os.getenv("PULLBACK_ATR_BAND", "0.75"))
+MAX_HOLD_HOURS = float(os.getenv("MAX_HOLD_HOURS", "24.0"))
+
 POLL_INTERVAL_SEC = 60
-
 PIN_INTERVAL_DEFAULT_SEC = 30
 PIN_INTERVAL_MIN_SEC = 10
 PIN_INTERVAL_MAX_SEC = 3600
@@ -74,7 +78,11 @@ logging.basicConfig(
 # ==========================================
 state_lock = threading.Lock()
 scan_lock = threading.Lock()
+universe_lock = threading.Lock()
+
 cached_markets: dict = {}
+cached_top_symbols: list[str] = list(PINNED_SYMBOLS)
+last_universe_refresh_ts: float = 0.0
 
 rds = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -82,7 +90,7 @@ exchange = ccxt.gate({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "option"},
+    "options": {"defaultType": "swap"},
 })
 
 if USE_TESTNET:
@@ -97,46 +105,56 @@ def load_state() -> dict:
     if raw:
         try:
             data = json.loads(raw)
-            data.setdefault("active_trade", None)
+            trades = data.get("active_trades")
+            if not isinstance(trades, list):
+                legacy = data.get("active_trade")
+                trades = [legacy] if isinstance(legacy, dict) else []
+            data["active_trades"] = trades
             data.setdefault("paused", False)
             data.setdefault("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)
             data.setdefault("pin_message_id", None)
             data.setdefault("last_scan", None)
+            data.setdefault("scan_cursor", 0)
             return data
         except json.JSONDecodeError:
             logging.error("Corrupted Redis state JSON; resetting to default.")
     return {
-        "active_trade": None,
+        "active_trades": [],
         "paused": False,
         "pin_interval_sec": PIN_INTERVAL_DEFAULT_SEC,
         "pin_message_id": None,
         "last_scan": None,
+        "scan_cursor": 0,
     }
 
 
 def save_state(state: dict):
+    state["active_trades"] = list(state.get("active_trades") or [])
+    state["active_trade"] = state["active_trades"][0] if state["active_trades"] else None
     rds.set(REDIS_STATE_KEY, json.dumps(state))
 
 
 def record_scan_diagnostics(
     status: str,
     reason: str,
+    symbol: str | None = None,
     spot: float | None = None,
     ema_50: float | None = None,
-    spread_type: str | None = None,
-    spread_label: str | None = None,
-    credit_ratio: float | None = None,
+    atr_15m: float | None = None,
+    setup_side: str | None = None,
+    pair_summaries: list[dict] | None = None,
 ):
     now_ist = datetime.now(IST).strftime("%d %b %H:%M:%S IST")
     scan_info = {
         "checked_at_ist": now_ist,
         "status": status,
         "reason": reason,
-        "spot": round(float(spot), 2) if spot is not None else None,
-        "ema_50": round(float(ema_50), 2) if ema_50 is not None else None,
-        "spread_type": spread_type,
-        "spread_label": spread_label,
-        "credit_ratio_pct": round(float(credit_ratio) * 100.0, 2) if credit_ratio is not None else None,
+        "symbol": symbol,
+        "spot": round(float(spot), 4) if spot is not None else None,
+        "ema_50": round(float(ema_50), 4) if ema_50 is not None else None,
+        "atr_15m": round(float(atr_15m), 4) if atr_15m is not None else None,
+        "setup_side": setup_side,
+        "pair_summaries": pair_summaries or [],
     }
     with state_lock:
         state = load_state()
@@ -165,18 +183,14 @@ def update_stats(pnl: float):
     rds.set(REDIS_STATS_KEY, json.dumps(stats))
 
 
-def record_closed_trade(trade: dict, realized_pnl: float, exit_reason: str):
+def record_closed_trade(trade: dict, exit_price: float, realized_pnl: float, exit_reason: str):
     now_iso = datetime.now(timezone.utc).isoformat()
     record = {
-        "spread_type": trade.get("spread_type"),
-        "spread_label": trade.get("spread_label"),
-        "short_sym": trade.get("short_sym"),
-        "long_sym": trade.get("long_sym"),
-        "short_strike": trade.get("short_strike"),
-        "long_strike": trade.get("long_strike"),
-        "short_delta": trade.get("short_delta"),
-        "long_delta": trade.get("long_delta"),
-        "entry_credit": round(float(trade.get("entry_credit", 0.0)), 4),
+        "symbol": trade.get("symbol"),
+        "side": trade.get("side"),
+        "amount": trade.get("amount"),
+        "entry_price": round(float(trade.get("entry_price", 0.0)), 4),
+        "exit_price": round(float(exit_price), 4),
         "realized_pnl": round(float(realized_pnl), 4),
         "exit_reason": exit_reason,
         "opened_at": trade.get("opened_at"),
@@ -197,6 +211,189 @@ def load_trade_history(limit: int = 25) -> list[dict]:
         except json.JSONDecodeError:
             logging.warning("Skipping malformed trade record in Redis history.")
     return rows
+
+
+# ==========================================
+# UNIVERSE DISCOVERY & ROTATION
+# ==========================================
+def _quote_volume_24h(ticker: dict | None) -> float:
+    if not ticker:
+        return 0.0
+    qv = ticker.get("quoteVolume")
+    if qv is not None:
+        try:
+            val = float(qv)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    bv = ticker.get("baseVolume")
+    px = ticker.get("last") or ticker.get("close") or ticker.get("mark")
+    if bv is not None and px is not None:
+        try:
+            return max(0.0, float(bv) * float(px))
+        except (TypeError, ValueError):
+            pass
+    info = ticker.get("info") or {}
+    for k in ("quote_volume", "usdt_vol", "volume_24h_quote"):
+        if info.get(k) is not None:
+            try:
+                return max(0.0, float(info[k]))
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def get_top_gate_perp_symbols(markets: dict, force_refresh: bool = False) -> list[str]:
+    global cached_top_symbols, last_universe_refresh_ts
+    now = time.monotonic()
+    with universe_lock:
+        if not force_refresh and cached_top_symbols and (now - last_universe_refresh_ts) < UNIVERSE_REFRESH_SEC:
+            return list(cached_top_symbols)
+
+        try:
+            tickers = exchange.fetch_tickers()
+        except Exception as e:
+            logging.warning(f"fetch_tickers() for Top {TOP_N_COINS} failed ({e}); using cached/pinned symbols.")
+            tickers = {}
+
+        ranked: list[tuple[float, str]] = []
+        for sym, m in (markets or {}).items():
+            if not m.get("active") or not m.get("swap"):
+                continue
+            if m.get("linear") is False or m.get("settle") != "USDT" or m.get("quote") != "USDT":
+                continue
+            vol = _quote_volume_24h(tickers.get(sym))
+            ranked.append((vol, sym))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        top_syms = [sym for _, sym in ranked[:TOP_N_COINS]]
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for sym in PINNED_SYMBOLS + top_syms:
+            if sym in (markets or {}) and sym not in seen:
+                seen.add(sym)
+                ordered.append(sym)
+
+        if ordered:
+            cached_top_symbols = ordered
+            last_universe_refresh_ts = now
+            logging.info(f"Refreshed Gate Top {TOP_N_COINS} USDT perp universe: {len(ordered)} active symbols.")
+        elif not cached_top_symbols:
+            cached_top_symbols = list(PINNED_SYMBOLS)
+
+        return list(cached_top_symbols)
+
+
+def get_next_scan_slice(markets: dict) -> tuple[list[str], int, int]:
+    """
+    Returns (symbols_to_scan, next_cursor, rotatable_total) where PINNED_SYMBOLS
+    are checked first and a slice of up to MAX_PAIRS_PER_CYCLE rotates through
+    the remaining Top-N Gate.io USDT perpetuals.
+    """
+    top_symbols = get_top_gate_perp_symbols(markets)
+    pinned_set = set(PINNED_SYMBOLS)
+
+    pinned_active = [s for s in PINNED_SYMBOLS if s in markets and markets[s].get("active")]
+    rotatable = [s for s in top_symbols if s not in pinned_set]
+
+    if not rotatable:
+        return pinned_active[:MAX_PAIRS_PER_CYCLE], 0, 0
+
+    with state_lock:
+        state = load_state()
+        cursor = int(state.get("scan_cursor") or 0) % len(rotatable)
+
+    slots_for_rotatable = max(1, MAX_PAIRS_PER_CYCLE - len(pinned_active))
+    take = min(len(rotatable), slots_for_rotatable)
+
+    slice_syms: list[str] = []
+    for offset in range(take):
+        slice_syms.append(rotatable[(cursor + offset) % len(rotatable)])
+
+    next_cursor = (cursor + take) % len(rotatable)
+    combined = pinned_active + slice_syms
+    return combined, next_cursor, len(rotatable)
+
+
+# ==========================================
+# INDICATORS & MARKET DATA
+# ==========================================
+def calc_ema(values: list[float], period: int) -> float:
+    mult = 2.0 / (period + 1)
+    ema = float(values[0])
+    for v in values[1:]:
+        ema = (float(v) - ema) * mult + ema
+    return ema
+
+
+def calc_atr(ohlcv: list, period: int = 14) -> float:
+    if len(ohlcv) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(ohlcv)):
+        high = float(ohlcv[i][2])
+        low = float(ohlcv[i][3])
+        prev_close = float(ohlcv[i - 1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    recent = trs[-period:]
+    return sum(recent) / len(recent)
+
+
+def fetch_market_snapshot(symbol: str):
+    h1 = exchange.fetch_ohlcv(symbol, timeframe=TREND_TF, limit=EMA_SLOW_LEN + 15)
+    m15 = exchange.fetch_ohlcv(symbol, timeframe=ENTRY_TF, limit=max(EMA_FAST_LEN, ATR_LEN) + 15)
+
+    h1_closes = [float(c[4]) for c in h1]
+    m15_closes = [float(c[4]) for c in m15]
+
+    spot = m15_closes[-1]
+    ema_50_1h = calc_ema(h1_closes, EMA_SLOW_LEN)
+    ema_20_15m = calc_ema(m15_closes, EMA_FAST_LEN)
+    atr_15m = calc_atr(m15, ATR_LEN)
+
+    return {
+        "symbol": symbol,
+        "spot": spot,
+        "ema_50_1h": ema_50_1h,
+        "ema_20_15m": ema_20_15m,
+        "atr_15m": atr_15m,
+    }
+
+
+def fetch_mark_price(symbol: str, fallback: float) -> float:
+    ticker = exchange.fetch_ticker(symbol)
+    px = ticker.get("last") or ticker.get("mark") or fallback
+    return float(px)
+
+
+def calc_unrealized_pnl(trade: dict, mark_price: float) -> float:
+    entry = float(trade["entry_price"])
+    amt = float(trade["amount"])
+    contract_size = float(trade.get("contract_size", 1.0))
+    if trade["side"] == "long":
+        return (mark_price - entry) * amt * contract_size
+    return (entry - mark_price) * amt * contract_size
+
+
+def compute_order_amount(market: dict, symbol: str, spot: float, stop_distance: float) -> float:
+    if stop_distance <= 0 or spot <= 0:
+        return 0.0
+    contract_size = float(market.get("contractSize") or 1.0)
+    raw_qty = RISK_PER_TRADE_USDT / (stop_distance * contract_size)
+    min_amt = float((market.get("limits") or {}).get("amount", {}).get("min") or 0.001)
+    qty = max(min_amt, raw_qty)
+    return float(exchange.amount_to_precision(symbol, qty))
+
+
+def place_market_order(symbol: str, side: str, amount: float) -> dict:
+    return exchange.create_order(symbol, "market", side, amount)
+
+
+def _fmt_px(val: float) -> str:
+    return f"{val:.4f}" if abs(val) < 50 else f"{val:.2f}"
 
 
 # ==========================================
@@ -246,84 +443,35 @@ def send_telegram(text: str):
     send_telegram_to(str(TELEGRAM_CHAT_ID), text)
 
 
-def get_unrealized_pnl(trade: dict) -> tuple[float, float]:
-    short_ob = exchange.fetch_order_book(trade["short_sym"], limit=5)
-    long_ob = exchange.fetch_order_book(trade["long_sym"], limit=5)
-    cost_to_close = float(short_ob["asks"][0][0]) - float(long_ob["bids"][0][0])
-    pnl = float(trade["entry_credit"]) - cost_to_close
-    return pnl, cost_to_close
-
-
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _bs_put_delta(spot: float, strike: float, t_years: float, iv: float, r: float = RISK_FREE_RATE) -> float:
-    if t_years <= 0.0 or iv <= 0.0 or spot <= 0.0 or strike <= 0.0:
-        return -1.0 if spot < strike else 0.0
-    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * math.sqrt(t_years))
-    return _norm_cdf(d1) - 1.0
-
-
-def _bs_call_delta(spot: float, strike: float, t_years: float, iv: float, r: float = RISK_FREE_RATE) -> float:
-    if t_years <= 0.0 or iv <= 0.0 or spot <= 0.0 or strike <= 0.0:
-        return 1.0 if spot > strike else 0.0
-    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * math.sqrt(t_years))
-    return _norm_cdf(d1)
-
-
-def _estimate_live_leg_delta(trade: dict, side: str, now_ms: int) -> float | None:
-    key = "short_delta" if side == "short" else "long_delta"
-    if trade.get(key) is not None:
-        return float(trade[key])
-    try:
-        is_call = trade.get("spread_type") == "bear_call"
-        strike = float(trade.get("short_strike" if side == "short" else "long_strike") or 0.0)
-        expiry_ms = int(trade.get("expiry_ms") or 0)
-        t_years = max((expiry_ms - now_ms) / (1000 * 60 * 60 * 24 * 365.0), 1e-6)
-        ticker = exchange.fetch_ticker(UNDERLYING)
-        spot = float(ticker.get("last") or 0.0)
-        if spot > 0 and strike > 0:
-            return _bs_call_delta(spot, strike, t_years, 0.60) if is_call else _bs_put_delta(spot, strike, t_years, 0.60)
-    except Exception:
-        pass
-    return None
-
-
 def build_pinned_status_text(state: dict, stats: dict) -> str:
-    now_ms = int(time.time() * 1000)
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     status_flag = "PAUSED" if state.get("paused") else "RUNNING"
     pin_sec = int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC))
-    trade = state.get("active_trade")
+    trades = state.get("active_trades") or []
     last_scan = state.get("last_scan")
 
-    if trade:
-        try:
-            pnl, cost_to_close = get_unrealized_pnl(trade)
-            pnl_line = f"Live Spread PnL: <code>{pnl:+.4f}</code> (Close: <code>{cost_to_close:.4f}</code>)"
-        except Exception as e:
-            pnl_line = f"Live Spread PnL: <i>Quote unavailable ({e})</i>"
-
-        hours_left = max(0.0, (int(trade.get("expiry_ms", now_ms)) - now_ms) / 3600000.0)
-        s_delta = _estimate_live_leg_delta(trade, "short", now_ms)
-        l_delta = _estimate_live_leg_delta(trade, "long", now_ms)
-        s_delta_str = f"{s_delta:+.3f}" if s_delta is not None else "N/A"
-        l_delta_str = f"{l_delta:+.3f}" if l_delta is not None else "N/A"
-        spread_label = trade.get("spread_label") or "Credit Spread"
-
-        position_block = (
-            f"<b>Active Spread:</b> {spread_label}\n"
-            f"Short: <code>{trade.get('short_sym')}</code> (Δ <code>{s_delta_str}</code>)\n"
-            f"Long:  <code>{trade.get('long_sym')}</code> (Δ <code>{l_delta_str}</code>)\n"
-            f"Entry Credit: <code>{float(trade.get('entry_credit', 0.0)):.4f}</code> | "
-            f"Max Loss: <code>{float(trade.get('max_loss', 0.0)):.4f}</code>\n"
-            f"{pnl_line}\n"
-            f"Time to Expiry: <code>{hours_left:.1f}h</code>"
-        )
+    if trades:
+        lines = [f"<b>Active Positions ({len(trades)}/{MAX_OPEN_POSITIONS}):</b>"]
+        total_u_pnl = 0.0
+        for tr in trades:
+            sym = tr["symbol"]
+            try:
+                mark = fetch_mark_price(sym, float(tr["entry_price"]))
+                u_pnl = calc_unrealized_pnl(tr, mark)
+                total_u_pnl += u_pnl
+                pnl_part = f"PnL <code>{u_pnl:+.4f}</code> @ <code>{_fmt_px(mark)}</code>"
+            except Exception as e:
+                pnl_part = f"PnL <i>N/A ({e})</i>"
+            lines.append(
+                f"• <code>{sym}</code> {tr.get('side', '').upper()} <code>{tr.get('amount')}</code> "
+                f"(Stop <code>{_fmt_px(float(tr.get('stop_price', 0.0)))}</code> / "
+                f"TP <code>{_fmt_px(float(tr.get('tp_price', 0.0)))}</code>) → {pnl_part}"
+            )
+        lines.append(f"Total Unrealized: <code>{total_u_pnl:+.4f} USDT</code>")
+        position_block = "\n".join(lines)
     else:
         scan_note = f"\n<i>Last Scan: {last_scan.get('reason')}</i>" if last_scan else ""
-        position_block = f"<b>Active Spread:</b> None (Flat / Scanning){scan_note}"
+        position_block = f"<b>Active Positions:</b> 0/{MAX_OPEN_POSITIONS} (Flat / Scanning){scan_note}"
 
     total = int(stats.get("total_trades", 0))
     wins = int(stats.get("wins", 0))
@@ -332,7 +480,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     realized = float(stats.get("realized_pnl", 0.0))
 
     return (
-        f"<b>BTC Credit Spread Live Card [{status_flag}]</b>\n"
+        f"<b>ATR Top-{TOP_N_COINS} Bot [{status_flag}]</b>\n"
         f"{position_block}\n\n"
         f"<b>Realized Stats:</b> {wins}W / {losses}L ({win_rate:.1f}%) | "
         f"PnL: <code>{realized:+.4f}</code>\n"
@@ -402,11 +550,79 @@ def pinned_card_worker():
         time.sleep(max(PIN_INTERVAL_MIN_SEC, interval))
 
 
+def close_single_position(trade: dict, reason: str, exit_price_hint: float | None = None) -> float:
+    sym = trade["symbol"]
+    close_side = "sell" if trade["side"] == "long" else "buy"
+    order = place_market_order(sym, close_side, float(trade["amount"]))
+    exit_px = float(order.get("average") or order.get("price") or 0.0)
+    if exit_px <= 0:
+        exit_px = exit_price_hint if exit_price_hint is not None else fetch_mark_price(sym, float(trade["entry_price"]))
+
+    pnl = calc_unrealized_pnl(trade, exit_px)
+    update_stats(pnl)
+    record_closed_trade(trade, exit_px, pnl, reason)
+
+    with state_lock:
+        state = load_state()
+        remaining = [
+            t for t in (state.get("active_trades") or [])
+            if not (t.get("symbol") == sym and t.get("opened_at") == trade.get("opened_at"))
+        ]
+        state["active_trades"] = remaining
+        save_state(state)
+
+    send_telegram(
+        f"<b>Position Closed — {reason}</b>\n"
+        f"Pair: <code>{sym}</code> | Side: <code>{trade['side'].upper()}</code> | Qty: <code>{trade['amount']}</code>\n"
+        f"Entry: <code>{_fmt_px(float(trade['entry_price']))}</code> → Exit: <code>{_fmt_px(exit_px)}</code>\n"
+        f"Realized PnL: <code>{pnl:+.4f} USDT</code>"
+    )
+    ensure_and_update_pinned_card(force_new=False)
+    return pnl
+
+
+def close_position_by_symbol(symbol: str, reason: str = "Manual Web UI Close") -> dict:
+    with scan_lock:
+        with state_lock:
+            state = load_state()
+            trades = list(state.get("active_trades") or [])
+            target = next((t for t in trades if t.get("symbol") == symbol), None)
+
+        if not target:
+            return {"ok": True, "closed": False, "symbol": symbol, "detail": "Position not active"}
+
+        pnl = close_single_position(target, reason)
+        return {"ok": True, "closed": True, "symbol": symbol, "realized_pnl": round(pnl, 4)}
+
+
+def close_all_positions_now(reason: str) -> tuple[int, float]:
+    with state_lock:
+        state = load_state()
+        trades = list(state.get("active_trades") or [])
+
+    if not trades:
+        return 0, 0.0
+
+    total_pnl = 0.0
+    closed_count = 0
+    for tr in trades:
+        try:
+            pnl = close_single_position(tr, reason)
+            total_pnl += pnl
+            closed_count += 1
+        except Exception as e:
+            logging.error(f"Failed closing {tr.get('symbol')}: {e}")
+            send_telegram(f"<b>Error closing {tr.get('symbol')}:</b> <code>{e}</code>")
+
+    return closed_count, total_pnl
+
+
 def telegram_command_worker():
     if not _tg_configured():
         logging.warning("Telegram token not configured; command listener disabled.")
         return
 
+    _tg_api("deleteWebhook", {"drop_pending_updates": False})
     offset = None
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     logging.info("Telegram command listener started.")
@@ -418,19 +634,20 @@ def telegram_command_worker():
                 params["offset"] = offset
             resp = requests.get(base_url, params=params, timeout=30)
             if resp.status_code != 200:
+                logging.warning(f"Telegram getUpdates HTTP {resp.status_code}: {resp.text[:200]}")
                 time.sleep(3)
                 continue
 
             for upd in resp.json().get("result", []):
                 offset = upd["update_id"] + 1
-                msg = upd.get("message", {})
+                msg = upd.get("message") or upd.get("edited_message") or {}
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = (msg.get("text") or "").strip()
 
                 if not chat_id or not text.startswith("/"):
                     continue
 
-                cmd = text.split()[0].lower()
+                cmd = text.split()[0].split("@")[0].lower()
 
                 if cmd == "/chatid":
                     send_telegram_to(chat_id, f"Chat ID: <code>{chat_id}</code>")
@@ -446,28 +663,19 @@ def telegram_command_worker():
                     send_telegram(build_pinned_status_text(state, stats))
 
                 elif cmd == "/scannow":
-                    send_telegram("<b>Scanning now...</b> Running immediate option &amp; trend check.")
-                    result = perform_scan_cycle()
-                    scan = (result or {}).get("last_scan") or {}
-
-                    status = scan.get("status", "UNKNOWN")
-                    reason = scan.get("reason", "No scan details available.")
-                    spot = scan.get("spot")
-                    ema = scan.get("ema_50")
-                    regime = scan.get("spread_label") or "--"
-                    ratio = scan.get("credit_ratio_pct")
-                    checked_at = scan.get("checked_at_ist") or "--"
-
-                    spot_str = f"{float(spot):.2f}" if spot is not None else "--"
-                    ema_str = f"{float(ema):.2f}" if ema is not None else "--"
-                    ratio_str = f"{float(ratio):.2f}%" if ratio is not None else "--"
-
                     send_telegram(
-                        f"<b>Scan Result [{status}]</b>\n"
-                        f"Spot: <code>{spot_str}</code> | 1h EMA-50: <code>{ema_str}</code>\n"
-                        f"Regime: <code>{regime}</code> | Credit Ratio: <code>{ratio_str}</code>\n"
-                        f"Detail: {reason}\n"
-                        f"<i>{checked_at}</i>"
+                        f"<b>Scanning Top {TOP_N_COINS} slice ({MAX_PAIRS_PER_CYCLE}/cycle)...</b> "
+                        f"(Max concurrent: <code>{MAX_OPEN_POSITIONS}</code>)"
+                    )
+                    res = perform_scan_cycle()
+                    scan = (res or {}).get("last_scan") or {}
+                    pairs_txt = ""
+                    for p in scan.get("pair_summaries") or []:
+                        pairs_txt += f"\n• <code>{p.get('symbol')}</code>: {p.get('detail')}"
+                    send_telegram(
+                        f"<b>Scan [{scan.get('status', 'UNKNOWN')}]</b>\n"
+                        f"Summary: {scan.get('reason', '--')}{pairs_txt}\n"
+                        f"<i>{scan.get('checked_at_ist', '--')}</i>"
                     )
 
                 elif cmd == "/pause":
@@ -483,16 +691,13 @@ def telegram_command_worker():
                         state = load_state()
                         state["paused"] = False
                         save_state(state)
-                    send_telegram("<b>Bot Resumed.</b> Scanning for setups.")
+                    send_telegram("<b>Bot Resumed.</b> Scanning Top-100 slice for setups.")
                     ensure_and_update_pinned_card(force_new=False)
 
                 elif cmd == "/setpinsec":
                     parts = text.split()
                     if len(parts) < 2 or not parts[1].isdigit():
-                        send_telegram(
-                            f"Usage: <code>/setpinsec &lt;seconds&gt;</code> "
-                            f"({PIN_INTERVAL_MIN_SEC}–{PIN_INTERVAL_MAX_SEC}s)"
-                        )
+                        send_telegram(f"Usage: <code>/setpinsec &lt;seconds&gt;</code> ({PIN_INTERVAL_MIN_SEC}–{PIN_INTERVAL_MAX_SEC}s)")
                     else:
                         clamped = max(PIN_INTERVAL_MIN_SEC, min(PIN_INTERVAL_MAX_SEC, int(parts[1])))
                         with state_lock:
@@ -505,28 +710,16 @@ def telegram_command_worker():
                 elif cmd == "/closeall":
                     with state_lock:
                         state = load_state()
-                        trade = state.get("active_trade")
                         state["paused"] = True
-                        if not trade:
-                            save_state(state)
-                            send_telegram("<b>/closeall:</b> No active spread open. Bot is now <b>PAUSED</b>.")
-                        else:
-                            try:
-                                pnl = close_spread(trade["short_sym"], trade["long_sym"], trade["entry_credit"])
-                                update_stats(pnl)
-                                record_closed_trade(trade, pnl, "Emergency /closeall")
-                                state["active_trade"] = None
-                                save_state(state)
-                                send_telegram(
-                                    f"<b>EMERGENCY /closeall EXECUTED</b>\n"
-                                    f"Closed: <code>{trade['short_sym']}</code> / <code>{trade['long_sym']}</code>\n"
-                                    f"Realized PnL: <code>{pnl:+.4f}</code>\n"
-                                    f"Bot is now <b>PAUSED</b>."
-                                )
-                            except Exception as e:
-                                save_state(state)
-                                send_telegram(f"<b>CRITICAL: /closeall failed!</b> Check exchange manually: {e}")
-                    ensure_and_update_pinned_card(force_new=False)
+                        save_state(state)
+                    closed_cnt, total_pnl = close_all_positions_now("Emergency /closeall")
+                    if closed_cnt == 0:
+                        send_telegram("<b>/closeall:</b> No active positions open. Bot is now <b>PAUSED</b>.")
+                    else:
+                        send_telegram(
+                            f"<b>Bot PAUSED</b> after closing {closed_cnt} position(s) "
+                            f"(Total PnL: <code>{total_pnl:+.4f}</code>)."
+                        )
 
         except Exception as e:
             logging.error(f"Telegram polling error: {e}")
@@ -534,399 +727,7 @@ def telegram_command_worker():
 
 
 # ==========================================
-# DUAL-REGIME DELTA STRIKE SELECTION & EXECUTION
-# ==========================================
-def get_spot_and_ema(ema_period: int = 50):
-    ohlcv = exchange.fetch_ohlcv(UNDERLYING, timeframe="1h", limit=ema_period + 10)
-    closes = [candle[4] for candle in ohlcv]
-    spot = float(closes[-1])
-    multiplier = 2 / (ema_period + 1)
-    ema = float(closes[0])
-    for price in closes[1:]:
-        ema = (float(price) - ema) * multiplier + ema
-    return spot, ema
-
-
-def _bs_put_price(spot: float, strike: float, t_years: float, iv: float, r: float = RISK_FREE_RATE) -> float:
-    if t_years <= 0.0 or iv <= 0.0:
-        return max(0.0, strike - spot)
-    sqrt_t = math.sqrt(t_years)
-    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * sqrt_t)
-    d2 = d1 - iv * sqrt_t
-    return strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
-
-
-def _bs_call_price(spot: float, strike: float, t_years: float, iv: float, r: float = RISK_FREE_RATE) -> float:
-    if t_years <= 0.0 or iv <= 0.0:
-        return max(0.0, spot - strike)
-    sqrt_t = math.sqrt(t_years)
-    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t_years) / (iv * sqrt_t)
-    d2 = d1 - iv * sqrt_t
-    return spot * _norm_cdf(d1) - strike * math.exp(-r * t_years) * _norm_cdf(d2)
-
-
-def _implied_option_vol(option_type: str, price: float, spot: float, strike: float, t_years: float, r: float = RISK_FREE_RATE) -> float:
-    is_call = option_type == "call"
-    intrinsic = (
-        max(0.0, spot - strike * math.exp(-r * t_years))
-        if is_call
-        else max(0.0, strike * math.exp(-r * t_years) - spot)
-    )
-    if price <= intrinsic + 1e-8 or t_years <= 0.0:
-        return 0.60
-    low, high = 0.05, 3.0
-    for _ in range(50):
-        mid = 0.5 * (low + high)
-        px = _bs_call_price(spot, strike, t_years, mid, r) if is_call else _bs_put_price(spot, strike, t_years, mid, r)
-        if abs(px - price) < 1e-6:
-            return mid
-        if px > price:
-            high = mid
-        else:
-            low = mid
-    return 0.5 * (low + high)
-
-
-def _extract_option_delta(option_type: str, market: dict, ticker: dict | None, spot: float, t_years: float) -> float | None:
-    is_call = option_type == "call"
-    info = (ticker or {}).get("info") or {}
-    greeks = (ticker or {}).get("greeks") or info.get("greeks") or {}
-
-    raw_delta = None
-    for candidate in (
-        greeks.get("delta"),
-        (ticker or {}).get("delta"),
-        info.get("delta"),
-        market.get("info", {}).get("delta") if isinstance(market.get("info"), dict) else None,
-    ):
-        if candidate is not None and candidate != "":
-            try:
-                raw_delta = float(candidate)
-                break
-            except (TypeError, ValueError):
-                pass
-
-    if raw_delta is not None:
-        return abs(raw_delta) if is_call else (-abs(raw_delta))
-
-    strike = float(market.get("strike") or 0.0)
-    bid = (ticker or {}).get("bid")
-    ask = (ticker or {}).get("ask")
-    last = (ticker or {}).get("last") or info.get("mark_price") or info.get("markPrice")
-
-    ref_price = None
-    if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
-        ref_price = 0.5 * (float(bid) + float(ask))
-    elif last is not None and float(last) > 0:
-        ref_price = float(last)
-
-    if ref_price and strike > 0 and t_years > 0:
-        iv = _implied_option_vol(option_type, ref_price, spot, strike, t_years)
-        return _bs_call_delta(spot, strike, t_years, iv) if is_call else _bs_put_delta(spot, strike, t_years, iv)
-    return None
-
-
-def find_credit_spread_legs_by_delta(markets: dict, spot: float, spread_type: str):
-    is_bull_put = spread_type == "bull_put"
-    option_type = "put" if is_bull_put else "call"
-    target_short = TARGET_SHORT_PUT_DELTA if is_bull_put else TARGET_SHORT_CALL_DELTA
-    target_long = TARGET_LONG_PUT_DELTA if is_bull_put else TARGET_LONG_CALL_DELTA
-
-    now_ms = int(time.time() * 1000)
-    candidates_by_expiry = {}
-
-    for symbol, m in markets.items():
-        if not m.get("active") or m.get("type") != "option":
-            continue
-        if m.get("base") != "BTC" or m.get("optionType") != option_type:
-            continue
-        expiry_ms = m.get("expiry")
-        if not expiry_ms or not m.get("strike"):
-            continue
-        dte = (expiry_ms - now_ms) / (1000 * 60 * 60 * 24)
-        if MIN_DTE <= dte <= MAX_DTE:
-            candidates_by_expiry.setdefault(expiry_ms, []).append((symbol, m, dte))
-
-    if not candidates_by_expiry:
-        return None
-
-    chosen_expiry = sorted(candidates_by_expiry.keys())[0]
-    expiry_contracts = candidates_by_expiry[chosen_expiry]
-    symbols = [item[0] for item in expiry_contracts]
-
-    try:
-        tickers = exchange.fetch_tickers(symbols)
-    except Exception as e:
-        logging.warning(f"fetch_tickers failed ({e}); falling back to price IV estimate.")
-        tickers = {}
-
-    scored = []
-    for symbol, m, dte in expiry_contracts:
-        t_years = max(dte, 1e-6) / 365.0
-        delta = _extract_option_delta(option_type, m, tickers.get(symbol), spot, t_years)
-        if delta is None:
-            continue
-        valid_range = (-0.80 <= delta <= -0.02) if is_bull_put else (0.02 <= delta <= 0.80)
-        if valid_range:
-            scored.append({
-                **m,
-                "symbol": symbol,
-                "strike": float(m["strike"]),
-                "delta": delta,
-            })
-
-    if len(scored) < 2:
-        return None
-
-    short_leg = min(scored, key=lambda x: abs(x["delta"] - target_short))
-    long_leg = min(scored, key=lambda x: abs(x["delta"] - target_long))
-
-    if abs(short_leg["delta"] - target_short) > MAX_DELTA_DIFF:
-        return None
-    if abs(long_leg["delta"] - target_long) > MAX_DELTA_DIFF:
-        return None
-
-    if is_bull_put:
-        if short_leg["strike"] <= long_leg["strike"]:
-            return None
-        width = short_leg["strike"] - long_leg["strike"]
-    else:
-        if short_leg["strike"] >= long_leg["strike"]:
-            return None
-        width = long_leg["strike"] - short_leg["strike"]
-
-    return short_leg, long_leg, chosen_expiry, width
-
-
-def check_spread_edge(short_sym: str, long_sym: str, strike_width: float):
-    short_ob = exchange.fetch_order_book(short_sym, limit=5)
-    long_ob = exchange.fetch_order_book(long_sym, limit=5)
-    if not short_ob.get("bids") or not long_ob.get("asks"):
-        return None
-
-    short_bid = float(short_ob["bids"][0][0])
-    long_ask = float(long_ob["asks"][0][0])
-    net_credit = short_bid - long_ask
-    ratio = net_credit / strike_width if strike_width > 0 else 0.0
-
-    if net_credit <= 0 or ratio < MIN_CREDIT_RATIO:
-        return None
-
-    return {
-        "short_bid": short_bid,
-        "long_ask": long_ask,
-        "net_credit": net_credit,
-        "credit_ratio": ratio,
-        "max_loss": strike_width - net_credit,
-    }
-
-
-def _remaining_qty(order: dict, target_amount: float) -> float:
-    filled = float(order.get("filled") or 0.0)
-    if order.get("remaining") is not None:
-        return max(0.0, float(order["remaining"]))
-    return max(0.0, target_amount - filled)
-
-
-def _is_order_filled(order: dict, target_amount: float) -> bool:
-    status = (order.get("status") or "").lower()
-    filled = float(order.get("filled") or 0.0)
-    rem = _remaining_qty(order, target_amount)
-    return status == "closed" and filled + QTY_EPSILON >= target_amount and rem <= QTY_EPSILON
-
-
-def _safe_cancel_order(order_id: str, symbol: str) -> dict:
-    try:
-        return exchange.cancel_order(order_id, symbol)
-    except Exception as e:
-        logging.warning(f"Cancel order {order_id} ({symbol}) error: {e}; fetching order state.")
-        return exchange.fetch_order(order_id, symbol)
-
-
-def _avg_fill_price(order: dict, fallback_price: float) -> float:
-    avg = order.get("average")
-    if avg is not None and float(avg) > 0:
-        return float(avg)
-    cost = order.get("cost")
-    filled = order.get("filled")
-    if cost is not None and filled is not None and float(filled) > QTY_EPSILON:
-        return float(cost) / float(filled)
-    price = order.get("price")
-    if price is not None and float(price) > 0:
-        return float(price)
-    return float(fallback_price)
-
-
-def _compute_next_chase_price(symbol: str, side: str, anchor_price: float, current_price: float, step_idx: int, total_steps: int) -> float:
-    frac = min(1.0, step_idx / max(1, total_steps))
-    if side == "buy":
-        max_allowed = anchor_price * (1.0 + MAX_SLIPPAGE_PCT)
-        target = anchor_price + (max_allowed - anchor_price) * frac
-        try:
-            ob = exchange.fetch_order_book(symbol, limit=3)
-            if ob.get("asks"):
-                target = min(max_allowed, max(target, float(ob["asks"][0][0])))
-        except Exception:
-            pass
-        next_px = max(current_price, min(max_allowed, target))
-    else:
-        min_allowed = anchor_price * (1.0 - MAX_SLIPPAGE_PCT)
-        target = anchor_price - (anchor_price - min_allowed) * frac
-        try:
-            ob = exchange.fetch_order_book(symbol, limit=3)
-            if ob.get("bids"):
-                target = max(min_allowed, min(target, float(ob["bids"][0][0])))
-        except Exception:
-            pass
-        next_px = min(current_price, max(min_allowed, target))
-    return float(exchange.price_to_precision(symbol, next_px))
-
-
-def _update_or_replace_remainder(order_id: str, symbol: str, side: str, rem_amount: float, new_price: float) -> dict | None:
-    if exchange.has.get("editOrder"):
-        try:
-            return exchange.edit_order(order_id, symbol, "limit", side, rem_amount, new_price)
-        except Exception:
-            pass
-    cancelled = _safe_cancel_order(order_id, symbol)
-    already_filled = float(cancelled.get("filled") or 0.0)
-    actual_rem = max(0.0, rem_amount - already_filled)
-    if actual_rem <= QTY_EPSILON:
-        return cancelled
-    return exchange.create_order(symbol, "limit", side, actual_rem, new_price)
-
-
-def _unwind_partial_fill(symbol: str, side_opened: str, filled_qty: float, ref_price: float):
-    if filled_qty <= QTY_EPSILON:
-        return
-    unwind_side = "sell" if side_opened == "buy" else "buy"
-    try:
-        ob = exchange.fetch_order_book(symbol, limit=3)
-        if unwind_side == "sell" and ob.get("bids"):
-            unwind_px = float(ob["bids"][0][0]) * (1.0 - MAX_SLIPPAGE_PCT)
-        elif unwind_side == "buy" and ob.get("asks"):
-            unwind_px = float(ob["asks"][0][0]) * (1.0 + MAX_SLIPPAGE_PCT)
-        else:
-            unwind_px = ref_price * (0.98 if unwind_side == "sell" else 1.02)
-    except Exception:
-        unwind_px = ref_price * (0.98 if unwind_side == "sell" else 1.02)
-
-    unwind_px = float(exchange.price_to_precision(symbol, unwind_px))
-    order = exchange.create_order(symbol, "limit", unwind_side, filled_qty, unwind_px)
-    order_id = order.get("id")
-    if not order_id:
-        return
-
-    deadline = time.monotonic() + UNWIND_TIMEOUT_SEC
-    latest = order
-    while time.monotonic() < deadline:
-        if _is_order_filled(latest, filled_qty):
-            return
-        time.sleep(LEG_POLL_INTERVAL_SEC)
-        try:
-            latest = exchange.fetch_order(order_id, symbol)
-        except Exception:
-            pass
-    _safe_cancel_order(order_id, symbol)
-
-
-def _execute_leg_with_fill_check(symbol: str, side: str, amount: float, price: float, timeout_sec: float = LEG_FILL_TIMEOUT_SEC):
-    anchor_price = float(price)
-    current_price = float(exchange.price_to_precision(symbol, anchor_price))
-    order = exchange.create_order(symbol, "limit", side, amount, current_price)
-    order_id = order.get("id")
-    if not order_id:
-        return None
-
-    cumulative_filled = 0.0
-    latest_order = order
-
-    for step in range(MAX_CHASE_STEPS + 1):
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            try:
-                latest_order = exchange.fetch_order(order_id, symbol)
-            except Exception as e:
-                logging.warning(f"Transient fetch_order error ({order_id}): {e}")
-            if _is_order_filled(latest_order, amount):
-                return latest_order
-            time.sleep(LEG_POLL_INTERVAL_SEC)
-
-        try:
-            latest_order = exchange.fetch_order(order_id, symbol)
-        except Exception:
-            pass
-        if _is_order_filled(latest_order, amount):
-            return latest_order
-
-        cumulative_filled = float(latest_order.get("filled") or 0.0)
-        rem_qty = max(0.0, amount - cumulative_filled)
-        if rem_qty <= QTY_EPSILON:
-            return latest_order
-
-        if step < MAX_CHASE_STEPS:
-            next_price = _compute_next_chase_price(symbol, side, anchor_price, current_price, step + 1, MAX_CHASE_STEPS)
-            logging.info(f"[CHASE {step + 1}/{MAX_CHASE_STEPS}] {symbol} ({side}) stepping {current_price} -> {next_price}")
-            current_price = next_price
-            updated = _update_or_replace_remainder(order_id, symbol, side, rem_qty, current_price)
-            if updated and updated.get("id"):
-                order_id = updated["id"]
-                latest_order = updated
-        else:
-            break
-
-    cancelled = _safe_cancel_order(order_id, symbol)
-    if _is_order_filled(cancelled, amount):
-        return cancelled
-
-    final_filled = float(cancelled.get("filled") or cumulative_filled)
-    if final_filled > QTY_EPSILON:
-        _unwind_partial_fill(symbol, side, final_filled, _avg_fill_price(cancelled, current_price))
-    return None
-
-
-def open_spread(short_sym: str, long_sym: str, quote: dict):
-    long_order = _execute_leg_with_fill_check(long_sym, "buy", CONTRACTS, quote["long_ask"])
-    if not long_order:
-        return None
-    long_fill = _avg_fill_price(long_order, quote["long_ask"])
-
-    short_order = _execute_leg_with_fill_check(short_sym, "sell", CONTRACTS, quote["short_bid"])
-    if not short_order:
-        return None
-    short_fill = _avg_fill_price(short_order, quote["short_bid"])
-
-    return {
-        "short_fill_price": short_fill,
-        "long_fill_price": long_fill,
-        "actual_credit": short_fill - long_fill,
-    }
-
-
-def close_spread(short_sym: str, long_sym: str, entry_credit: float) -> float:
-    short_ob = exchange.fetch_order_book(short_sym, limit=5)
-    long_ob = exchange.fetch_order_book(long_sym, limit=5)
-    if not short_ob.get("asks") or not long_ob.get("bids"):
-        raise RuntimeError(f"Insufficient order book liquidity to close {short_sym} / {long_sym}")
-
-    buy_back_px = float(short_ob["asks"][0][0])
-    sell_out_px = float(long_ob["bids"][0][0])
-
-    short_close = _execute_leg_with_fill_check(short_sym, "buy", CONTRACTS, buy_back_px)
-    if not short_close:
-        raise RuntimeError(f"Failed to completely buy back short leg {short_sym}")
-    actual_buy_back = _avg_fill_price(short_close, buy_back_px)
-
-    long_close = _execute_leg_with_fill_check(long_sym, "sell", CONTRACTS, sell_out_px)
-    if not long_close:
-        raise RuntimeError(f"Short leg closed, but failed to completely sell long leg {long_sym}")
-    actual_sell_out = _avg_fill_price(long_close, sell_out_px)
-
-    return float(entry_credit) - (actual_buy_back - actual_sell_out)
-
-
-# ==========================================
-# SCAN & MONITOR CYCLE
+# SCAN & MONITOR CYCLE (ROTATING TOP-100)
 # ==========================================
 def perform_scan_cycle(markets: dict | None = None) -> dict:
     global cached_markets
@@ -939,164 +740,190 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
         try:
             with state_lock:
                 state = load_state()
-                active_trade = state.get("active_trade")
+                trades = list(state.get("active_trades") or [])
                 paused = bool(state.get("paused", False))
-                now_ms = int(time.time() * 1000)
 
-            if active_trade:
-                hours_to_exp = (int(active_trade["expiry_ms"]) - now_ms) / (1000 * 60 * 60)
-                pnl, _ = get_unrealized_pnl(active_trade)
+            # 1. Monitor all open positions first
+            updated_trades: list[dict] = []
+            for tr in trades:
+                sym = tr["symbol"]
+                try:
+                    snap = fetch_market_snapshot(sym)
+                    spot = snap["spot"]
+                    atr = max(snap["atr_15m"], float(tr.get("atr_at_entry") or 1.0))
+                    side = tr["side"]
+                    stop_px = float(tr["stop_price"])
+                    tp_px = float(tr["tp_price"])
 
-                tp_target = float(active_trade["entry_credit"]) * TAKE_PROFIT_PCT
-                sl_limit = -float(active_trade["entry_credit"]) * STOP_LOSS_MULT
+                    if side == "long":
+                        new_stop = max(stop_px, spot - TRAIL_ATR_MULT * atr)
+                        if new_stop > stop_px:
+                            tr["stop_price"] = round(new_stop, 4)
+                            stop_px = tr["stop_price"]
+                    else:
+                        new_stop = min(stop_px, spot + TRAIL_ATR_MULT * atr)
+                        if new_stop < stop_px:
+                            tr["stop_price"] = round(new_stop, 4)
+                            stop_px = tr["stop_price"]
 
-                exit_reason = None
-                if pnl >= tp_target:
-                    exit_reason = "Take Profit (50% Max Credit)"
-                elif pnl <= sl_limit:
-                    exit_reason = "Stop Loss (1.5x Credit)"
-                elif hours_to_exp <= EXIT_HOURS_BEFORE_EXP:
-                    exit_reason = "Time Exit (Pre-Expiry Pin Protection)"
+                    opened_dt = datetime.fromisoformat(tr["opened_at"])
+                    held_hours = (datetime.now(timezone.utc) - opened_dt).total_seconds() / 3600.0
 
-                if exit_reason:
-                    realized = close_spread(
-                        active_trade["short_sym"],
-                        active_trade["long_sym"],
-                        active_trade["entry_credit"],
-                    )
-                    update_stats(realized)
-                    record_closed_trade(active_trade, realized, exit_reason)
-                    with state_lock:
-                        state = load_state()
-                        state["active_trade"] = None
-                        save_state(state)
+                    exit_reason = None
+                    if side == "long":
+                        if spot <= stop_px:
+                            exit_reason = "ATR Trailing/Hard Stop"
+                        elif spot >= tp_px:
+                            exit_reason = f"Take Profit ({TP_ATR_MULT}x ATR)"
+                    else:
+                        if spot >= stop_px:
+                            exit_reason = "ATR Trailing/Hard Stop"
+                        elif spot <= tp_px:
+                            exit_reason = f"Take Profit ({TP_ATR_MULT}x ATR)"
 
-                    send_telegram(
-                        f"<b>Spread Closed — {exit_reason}</b>\n"
-                        f"Short: <code>{active_trade['short_sym']}</code>\n"
-                        f"Long: <code>{active_trade['long_sym']}</code>\n"
-                        f"Realized PnL: <code>{realized:+.4f}</code>"
-                    )
-                    ensure_and_update_pinned_card(force_new=False)
-                else:
-                    logging.info(
-                        f"Monitoring {active_trade['short_sym']} | "
-                        f"PnL: {pnl:+.4f} | Exp: {hours_to_exp:.1f}h"
-                    )
-                record_scan_diagnostics(
-                    "MONITORING",
-                    f"Active spread {active_trade['short_sym']} PnL={pnl:+.4f} ({hours_to_exp:.1f}h left).",
-                )
+                    if not exit_reason and held_hours >= MAX_HOLD_HOURS:
+                        exit_reason = f"Max Hold Time ({MAX_HOLD_HOURS:.0f}h)"
 
-            elif paused:
-                msg = "Bot is currently PAUSED; skipping new entries."
+                    u_pnl = calc_unrealized_pnl(tr, spot)
+                    if exit_reason:
+                        close_single_position(tr, exit_reason, exit_price_hint=spot)
+                    else:
+                        logging.info(
+                            f"Monitoring {sym} {side.upper()} | Spot={_fmt_px(spot)} "
+                            f"Stop={_fmt_px(stop_px)} TP={_fmt_px(tp_px)} PnL={u_pnl:+.4f}"
+                        )
+                        updated_trades.append(tr)
+                except Exception as e:
+                    logging.error(f"Error monitoring {sym}: {e}")
+                    updated_trades.append(tr)
+
+            with state_lock:
+                st = load_state()
+                st["active_trades"] = updated_trades
+                save_state(st)
+
+            open_count = len(updated_trades)
+            open_syms = {t["symbol"] for t in updated_trades}
+
+            if paused:
+                msg = f"Bot is PAUSED ({open_count}/{MAX_OPEN_POSITIONS} open). Skipping new entries."
                 logging.info(f"[SCAN] {msg}")
                 record_scan_diagnostics("PAUSED", msg)
-
+            elif open_count >= MAX_OPEN_POSITIONS:
+                msg = f"Max concurrent positions reached ({open_count}/{MAX_OPEN_POSITIONS}). Monitoring active trades."
+                logging.info(f"[SCAN] {msg}")
+                record_scan_diagnostics("MAX_POSITIONS", msg)
             else:
-                spot, ema_50 = get_spot_and_ema(50)
-                spread_type = "bull_put" if spot > ema_50 else "bear_call"
-                spread_label = "Bull Put Spread" if spread_type == "bull_put" else "Bear Call Spread"
+                scan_symbols, next_cursor, rotatable_total = get_next_scan_slice(active_markets)
+                with state_lock:
+                    st = load_state()
+                    st["scan_cursor"] = next_cursor
+                    save_state(st)
 
-                legs = find_credit_spread_legs_by_delta(active_markets, spot, spread_type)
-                if not legs:
-                    msg = f"No {spread_label} pair matched DTE ({MIN_DTE}-{MAX_DTE}d) & Delta targets."
-                    logging.info(f"[SCAN] Spot={spot:.2f}, EMA50={ema_50:.2f} | {msg}")
+                pair_summaries: list[dict] = []
+                opened_new = False
+                checked_count = 0
+
+                for sym in scan_symbols:
+                    if sym in open_syms:
+                        continue
+                    if len(open_syms) >= MAX_OPEN_POSITIONS:
+                        break
+
+                    mkt = active_markets.get(sym)
+                    if not mkt:
+                        continue
+
+                    try:
+                        snap = fetch_market_snapshot(sym)
+                    except Exception as e:
+                        logging.debug(f"Skipping {sym} snapshot error: {e}")
+                        continue
+
+                    checked_count += 1
+                    spot = snap["spot"]
+                    ema_50 = snap["ema_50_1h"]
+                    ema_20_15m = snap["ema_20_15m"]
+                    atr = snap["atr_15m"]
+
+                    if atr <= 0:
+                        continue
+
+                    band = PULLBACK_ATR_BAND * atr
+                    setup_side = None
+                    if spot > ema_50 and abs(spot - ema_20_15m) <= band and spot >= ema_20_15m * 0.997:
+                        setup_side = "long"
+                    elif spot < ema_50 and abs(spot - ema_20_15m) <= band and spot <= ema_20_15m * 1.003:
+                        setup_side = "short"
+
+                    if not setup_side:
+                        if len(pair_summaries) < 12:
+                            pair_summaries.append({
+                                "symbol": sym,
+                                "detail": f"Spot={_fmt_px(spot)} vs 1hEMA50={_fmt_px(ema_50)}, 15mEMA20={_fmt_px(ema_20_15m)}",
+                            })
+                        continue
+
+                    stop_dist = STOP_ATR_MULT * atr
+                    amt = compute_order_amount(mkt, sym, spot, stop_dist)
+                    if amt <= 0:
+                        continue
+
+                    order_side = "buy" if setup_side == "long" else "sell"
+                    order = place_market_order(sym, order_side, amt)
+                    entry_px = float(order.get("average") or order.get("price") or spot)
+                    stop_px = entry_px - STOP_ATR_MULT * atr if setup_side == "long" else entry_px + STOP_ATR_MULT * atr
+                    tp_px = entry_px + TP_ATR_MULT * atr if setup_side == "long" else entry_px - TP_ATR_MULT * atr
+
+                    new_trade = {
+                        "symbol": sym,
+                        "side": setup_side,
+                        "amount": amt,
+                        "contract_size": float(mkt.get("contractSize") or 1.0),
+                        "entry_price": round(entry_px, 4),
+                        "stop_price": round(stop_px, 4),
+                        "tp_price": round(tp_px, 4),
+                        "atr_at_entry": round(atr, 4),
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    with state_lock:
+                        st = load_state()
+                        current_list = list(st.get("active_trades") or [])
+                        current_list.append(new_trade)
+                        st["active_trades"] = current_list
+                        save_state(st)
+
+                    open_syms.add(sym)
+                    opened_new = True
+                    pair_summaries.insert(0, {"symbol": sym, "detail": f"OPENED {setup_side.upper()} @ {_fmt_px(entry_px)}"})
+
+                    send_telegram(
+                        f"<b>New {setup_side.upper()} Opened ({len(open_syms)}/{MAX_OPEN_POSITIONS})</b>\n"
+                        f"Pair: <code>{sym}</code> | Qty: <code>{amt}</code>\n"
+                        f"Entry: <code>{_fmt_px(entry_px)}</code> | Stop: <code>{_fmt_px(stop_px)}</code> | "
+                        f"TP: <code>{_fmt_px(tp_px)}</code>\n"
+                        f"Risk Cap: <code>{RISK_PER_TRADE_USDT:.2f} USDT</code>"
+                    )
+                    ensure_and_update_pinned_card(force_new=False)
+
                     record_scan_diagnostics(
-                        "SKIPPED",
-                        msg,
+                        "OPENED",
+                        f"Opened {setup_side.upper()} on {sym} ({len(open_syms)}/{MAX_OPEN_POSITIONS} active).",
+                        symbol=sym,
                         spot=spot,
                         ema_50=ema_50,
-                        spread_type=spread_type,
-                        spread_label=spread_label,
+                        atr_15m=atr,
+                        setup_side=setup_side,
+                        pair_summaries=pair_summaries[:12],
                     )
-                else:
-                    short_leg, long_leg, expiry_ms, width = legs
-                    quote = check_spread_edge(short_leg["symbol"], long_leg["symbol"], width)
-                    if not quote:
-                        msg = (
-                            f"Rejected {short_leg['symbol']} (Δ {short_leg['delta']:+.3f}) / "
-                            f"{long_leg['symbol']} (Δ {long_leg['delta']:+.3f}) due to bid/ask or credit < {MIN_CREDIT_RATIO*100:.0f}%."
-                        )
-                        logging.info(f"[SCAN] {msg}")
-                        record_scan_diagnostics(
-                            "SKIPPED",
-                            msg,
-                            spot=spot,
-                            ema_50=ema_50,
-                            spread_type=spread_type,
-                            spread_label=spread_label,
-                        )
-                    else:
-                        ratio = quote["credit_ratio"]
-                        msg = f"Valid {spread_label} setup! Credit={quote['net_credit']:.4f} ({ratio*100:.2f}% of width)."
-                        logging.info(f"[SCAN] {msg}")
-                        record_scan_diagnostics(
-                            "EXECUTING",
-                            msg,
-                            spot=spot,
-                            ema_50=ema_50,
-                            spread_type=spread_type,
-                            spread_label=spread_label,
-                            credit_ratio=ratio,
-                        )
 
-                        fills = open_spread(short_leg["symbol"], long_leg["symbol"], quote)
-                        if not fills:
-                            fail_msg = "Leg fill/chase incomplete; aborted cleanly with no open position."
-                            logging.warning(f"[SCAN] {fail_msg}")
-                            record_scan_diagnostics(
-                                "SKIPPED",
-                                fail_msg,
-                                spot=spot,
-                                ema_50=ema_50,
-                                spread_type=spread_type,
-                                spread_label=spread_label,
-                                credit_ratio=ratio,
-                            )
-                        else:
-                            actual_credit = float(fills["actual_credit"])
-                            actual_max_loss = width - actual_credit
-                            new_trade = {
-                                "spread_type": spread_type,
-                                "spread_label": spread_label,
-                                "short_sym": short_leg["symbol"],
-                                "long_sym": long_leg["symbol"],
-                                "short_strike": short_leg["strike"],
-                                "long_strike": long_leg["strike"],
-                                "short_delta": short_leg["delta"],
-                                "long_delta": long_leg["delta"],
-                                "short_fill_price": fills["short_fill_price"],
-                                "long_fill_price": fills["long_fill_price"],
-                                "entry_credit": actual_credit,
-                                "max_loss": actual_max_loss,
-                                "expiry_ms": expiry_ms,
-                                "opened_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            with state_lock:
-                                state = load_state()
-                                state["active_trade"] = new_trade
-                                state["last_scan"] = {
-                                    "checked_at_ist": datetime.now(IST).strftime("%d %b %H:%M:%S IST"),
-                                    "status": "OPENED",
-                                    "reason": f"Opened {spread_label} ({short_leg['strike']} / {long_leg['strike']}).",
-                                    "spot": round(spot, 2),
-                                    "ema_50": round(ema_50, 2),
-                                    "spread_type": spread_type,
-                                    "spread_label": spread_label,
-                                    "credit_ratio_pct": round(ratio * 100.0, 2),
-                                }
-                                save_state(state)
-
-                            send_telegram(
-                                f"<b>New {spread_label} Opened</b>\n"
-                                f"Spot: <code>{spot:.2f}</code> (EMA50: <code>{ema_50:.2f}</code>)\n"
-                                f"Short: <code>{short_leg['strike']}</code> (Δ <code>{short_leg['delta']:+.3f}</code>)\n"
-                                f"Long:  <code>{long_leg['strike']}</code> (Δ <code>{long_leg['delta']:+.3f}</code>)\n"
-                                f"Actual Credit: <code>{actual_credit:.4f}</code>\n"
-                                f"Max Loss Cap: <code>{actual_max_loss:.4f}</code>"
-                            )
-                            ensure_and_update_pinned_card(force_new=False)
+                if not opened_new:
+                    summary_line = (
+                        f"Rotated {checked_count} pairs (cursor->{next_cursor}/{rotatable_total} of Top {TOP_N_COINS}, "
+                        f"{len(open_syms)}/{MAX_OPEN_POSITIONS} open) — no entry triggers."
+                    )
+                    logging.info(f"[SCAN] {summary_line}")
+                    record_scan_diagnostics("SKIPPED", summary_line, pair_summaries=pair_summaries[:12])
 
         except Exception as e:
             logging.error(f"Scan cycle error: {e}")
@@ -1110,11 +937,15 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
 # ==========================================
 # FASTAPI WEB UI & HEALTHZ
 # ==========================================
-app = FastAPI(title="BTC Credit Spread Bot Dashboard")
+app = FastAPI(title="ATR Top-100 Bot Dashboard")
 
 
 class PinIntervalPayload(BaseModel):
     seconds: int
+
+
+class CloseSymbolPayload(BaseModel):
+    symbol: str
 
 
 def _verify_token(token: str | None):
@@ -1141,23 +972,20 @@ def healthz():
         redis_ok = bool(rds.ping())
     except Exception:
         redis_ok = False
-
     with state_lock:
-        try:
-            state = load_state()
-            paused = bool(state.get("paused", False))
-            has_trade = state.get("active_trade") is not None
-        except Exception:
-            paused = False
-            has_trade = False
-
+        st = load_state()
+        paused = bool(st.get("paused", False))
+        active_cnt = len(st.get("active_trades") or [])
     return {
         "status": "ok" if redis_ok else "degraded",
         "redis": redis_ok,
         "mode": "TESTNET" if USE_TESTNET else "LIVE",
         "port": WEB_UI_PORT,
+        "top_n_coins": TOP_N_COINS,
+        "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
+        "max_open_positions": MAX_OPEN_POSITIONS,
+        "active_positions_count": active_cnt,
         "paused": paused,
-        "has_active_trade": has_trade,
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
     }
 
@@ -1169,40 +997,34 @@ def api_state():
         stats = load_stats()
         history_raw = load_trade_history(limit=25)
 
-    now_ms = int(time.time() * 1000)
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    trade = state.get("active_trade")
-    live_trade = None
+    trades = state.get("active_trades") or []
+    live_trades = []
+    total_unrealized = 0.0
+    has_any_pnl = False
 
-    if trade:
+    for tr in trades:
+        sym = tr["symbol"]
         try:
-            pnl, cost_to_close = get_unrealized_pnl(trade)
+            mark = fetch_mark_price(sym, float(tr["entry_price"]))
+            u_pnl = round(calc_unrealized_pnl(tr, mark), 4)
+            total_unrealized += u_pnl
+            has_any_pnl = True
         except Exception:
-            pnl, cost_to_close = None, None
+            mark, u_pnl = None, None
 
-        expiry_ms = int(trade.get("expiry_ms", now_ms))
-        opened_iso = trade.get("opened_at")
-        try:
-            opened_ms = int(datetime.fromisoformat(opened_iso).timestamp() * 1000) if opened_iso else (expiry_ms - 5 * 86400000)
-        except Exception:
-            opened_ms = expiry_ms - 5 * 86400000
+        opened_dt = datetime.fromisoformat(tr["opened_at"])
+        elapsed_h = max(0.0, (datetime.now(timezone.utc) - opened_dt).total_seconds() / 3600.0)
+        rem_h = max(0.0, MAX_HOLD_HOURS - elapsed_h)
+        rem_pct = round(min(100.0, max(0.0, (rem_h / max(0.1, MAX_HOLD_HOURS)) * 100.0)), 1)
 
-        total_dur_ms = max(1, expiry_ms - opened_ms)
-        rem_ms = max(0, expiry_ms - now_ms)
-        rem_pct = round(min(100.0, max(0.0, (rem_ms / total_dur_ms) * 100.0)), 1)
-
-        s_delta = _estimate_live_leg_delta(trade, "short", now_ms)
-        l_delta = _estimate_live_leg_delta(trade, "long", now_ms)
-
-        live_trade = {
-            **trade,
-            "unrealized_pnl": round(pnl, 4) if pnl is not None else None,
-            "cost_to_close": round(cost_to_close, 4) if cost_to_close is not None else None,
-            "hours_left": round(rem_ms / 3600000.0, 2),
+        live_trades.append({
+            **tr,
+            "mark_price": round(mark, 4) if mark is not None else None,
+            "unrealized_pnl": u_pnl,
+            "hours_left": round(rem_h, 2),
             "remaining_pct": rem_pct,
-            "short_delta": round(s_delta, 3) if s_delta is not None else None,
-            "long_delta": round(l_delta, 3) if l_delta is not None else None,
-        }
+        })
 
     formatted_history = [
         {
@@ -1216,10 +1038,15 @@ def api_state():
     return {
         "server_time_ist": now_ist,
         "mode": "TESTNET" if USE_TESTNET else "LIVE",
+        "top_n_coins": TOP_N_COINS,
+        "max_pairs_per_cycle": MAX_PAIRS_PER_CYCLE,
+        "pinned_symbols": PINNED_SYMBOLS,
+        "max_open_positions": MAX_OPEN_POSITIONS,
         "paused": bool(state.get("paused", False)),
         "pin_interval_sec": int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)),
         "last_scan": state.get("last_scan"),
-        "active_trade": live_trade,
+        "active_trades": live_trades,
+        "total_unrealized_pnl": round(total_unrealized, 4) if has_any_pnl else None,
         "stats": stats,
         "trade_history": formatted_history,
     }
@@ -1229,6 +1056,23 @@ def api_state():
 def api_scan_now(token: str | None = None):
     _verify_token(token)
     return perform_scan_cycle()
+
+
+@app.post("/api/close-position")
+def api_close_position(
+    symbol: str | None = None,
+    payload: CloseSymbolPayload | None = None,
+    token: str | None = None,
+):
+    _verify_token(token)
+    target_symbol = (symbol or (payload.symbol if payload else "") or "").strip()
+    if not target_symbol:
+        raise HTTPException(status_code=400, detail="Missing symbol")
+    try:
+        return close_position_by_symbol(target_symbol, "Manual Web UI Close")
+    except Exception as e:
+        logging.error(f"Manual close failed for {target_symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/toggle-pause")
@@ -1261,31 +1105,11 @@ def api_close_all(token: str | None = None):
     _verify_token(token)
     with state_lock:
         state = load_state()
-        trade = state.get("active_trade")
         state["paused"] = True
-        if not trade:
-            save_state(state)
-            send_telegram("<b>Web UI /closeall:</b> No active spread open. Bot is now <b>PAUSED</b>.")
-            ensure_and_update_pinned_card(force_new=False)
-            return {"ok": True, "closed": False}
-        try:
-            pnl = close_spread(trade["short_sym"], trade["long_sym"], trade["entry_credit"])
-            update_stats(pnl)
-            record_closed_trade(trade, pnl, "Emergency /closeall")
-            state["active_trade"] = None
-            save_state(state)
-            send_telegram(
-                f"<b>WEB UI EMERGENCY /closeall EXECUTED</b>\n"
-                f"Closed: <code>{trade['short_sym']}</code> / <code>{trade['long_sym']}</code>\n"
-                f"Realized PnL: <code>{pnl:+.4f}</code>\n"
-                f"Bot is now <b>PAUSED</b>."
-            )
-            ensure_and_update_pinned_card(force_new=False)
-            return {"ok": True, "closed": True, "realized_pnl": round(pnl, 4)}
-        except Exception as e:
-            save_state(state)
-            send_telegram(f"<b>CRITICAL: Web UI /closeall failed!</b> Check exchange manually: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        save_state(state)
+    closed_cnt, total_pnl = close_all_positions_now("Emergency /closeall")
+    ensure_and_update_pinned_card(force_new=False)
+    return {"ok": True, "closed_count": closed_cnt, "realized_pnl": round(total_pnl, 4)}
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1293,7 +1117,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>BTC Credit Spread Bot</title>
+<title>ATR Top-100 Bot</title>
 <style>
   :root {
     --bg: #0b0f17; --card: #131a26; --border: #222d40;
@@ -1302,7 +1126,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
-  .wrap { max-width: 980px; margin: 0 auto; }
+  .wrap { max-width: 1020px; margin: 0 auto; }
   .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
   .title { font-size: 1.25rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
   .badge { font-size: 0.75rem; padding: 3px 8px; border-radius: 999px; font-weight: 600; }
@@ -1315,9 +1139,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .label { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .val { font-size: 1.4rem; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
   .pos { color: var(--green); } .neg { color: var(--red); }
-  .scan-row { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 0.88rem; align-items: center; }
   .scan-reason { margin-top: 8px; font-size: 0.9rem; color: var(--amber); }
-  .bar-bg { width: 100%; height: 10px; background: #1c2536; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+  .pair-list { margin-top: 10px; display: grid; gap: 6px; font-size: 0.84rem; color: var(--muted); }
+  .pos-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; background: #0f1520; }
+  .bar-bg { width: 100%; height: 8px; background: #1c2536; border-radius: 999px; overflow: hidden; margin-top: 8px; }
   .bar-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .4s ease; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
   button { cursor: pointer; border: none; border-radius: 8px; padding: 9px 14px; font-weight: 600; font-size: 0.85rem; }
@@ -1336,7 +1161,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="wrap">
   <div class="topbar">
     <div class="title">
-      BTC Dual-Regime Credit Spread
+      ATR Top-100 Pullback Bot
       <span id="modeBadge" class="badge badge-mode">TESTNET</span>
       <span id="statusBadge" class="badge badge-run">RUNNING</span>
     </div>
@@ -1346,41 +1171,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="grid">
-    <div class="card"><div class="label">Unrealized Spread PnL</div><div id="livePnl" class="val">--</div></div>
-    <div class="card"><div class="label">Realized Cumulative PnL</div><div id="realizedPnl" class="val">--</div></div>
+    <div class="card"><div class="label">Total Unrealized PnL</div><div id="livePnl" class="val">--</div></div>
+    <div class="card"><div class="label">Realized PnL (USDT)</div><div id="realizedPnl" class="val">--</div></div>
     <div class="card"><div class="label">Win / Loss Record</div><div id="winLoss" class="val">0W / 0L</div></div>
-    <div class="card"><div class="label">Max Loss Cap (Active)</div><div id="maxLoss" class="val">--</div></div>
+    <div class="card"><div class="label">Open Slots</div><div id="slotsVal" class="val">0 / 2</div></div>
   </div>
 
   <div class="card" style="margin-bottom:16px;">
-    <div class="label">Live Scanner Diagnostics</div>
-    <div class="scan-row">
-      <span>Spot: <b id="scanSpot">--</b></span>
-      <span>1h EMA-50: <b id="scanEma">--</b></span>
-      <span>Regime: <b id="scanRegime">--</b></span>
-      <span>Credit Ratio: <b id="scanRatio">--</b></span>
-      <span style="margin-left:auto; color:var(--muted);" id="scanTime">--</span>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div class="label">Live Scanner Diagnostics (<span id="universeLabel">--</span>)</div>
+      <span style="font-size:0.82rem; color:var(--muted);" id="scanTime">--</span>
     </div>
     <div id="scanReason" class="scan-reason">Waiting for first scan cycle...</div>
+    <div id="pairSummaries" class="pair-list"></div>
   </div>
 
   <div class="card" style="margin-bottom:16px;">
-    <div class="label">Active Spread Position (<span id="activeSpreadType">--</span>)</div>
-    <div id="noTradeMsg" style="margin-top:10px; color:var(--muted);">No active spread open.</div>
-    <div id="tradePanel" style="display:none;">
-      <table>
-        <thead><tr><th>Leg</th><th>Contract</th><th>Strike</th><th>Fill Price</th><th>Delta (Δ)</th></tr></thead>
-        <tbody>
-          <tr><td><b>Short Leg</b></td><td><code id="shortSym">--</code></td><td id="shortStrike">--</td><td id="shortFill">--</td><td id="shortDelta">--</td></tr>
-          <tr><td><b>Long Leg (Hedge)</b></td><td><code id="longSym">--</code></td><td id="longStrike">--</td><td id="longFill">--</td><td id="longDelta">--</td></tr>
-        </tbody>
-      </table>
-      <div style="display:flex; justify-content:space-between; margin-top:12px; font-size:0.85rem; color:var(--muted);">
-        <span>Entry Credit: <b id="entryCredit" style="color:var(--text);">--</b></span>
-        <span>Remaining Hold: <b id="hoursLeft" style="color:var(--text);">--</b>h (<span id="remPct">--</span>%)</span>
-      </div>
-      <div class="bar-bg"><div id="holdBar" class="bar-fill" style="width:0%;"></div></div>
-    </div>
+    <div class="label">Active Positions</div>
+    <div id="noTradeMsg" style="margin-top:10px; color:var(--muted);">No active positions open.</div>
+    <div id="tradesList"></div>
   </div>
 
   <div class="card">
@@ -1403,7 +1212,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="historyWrap" style="display:none; overflow-x:auto;">
       <table>
         <thead>
-          <tr><th>Entry → Exit (IST)</th><th>Spread</th><th>Strikes (S / L)</th><th>Deltas (S / L)</th><th>Reason</th><th>Realized PnL</th></tr>
+          <tr><th>Entry → Exit (IST)</th><th>Pair</th><th>Side</th><th>Entry → Exit</th><th>Reason</th><th>Realized PnL</th></tr>
         </thead>
         <tbody id="historyBody"></tbody>
       </table>
@@ -1416,12 +1225,21 @@ const token = new URLSearchParams(window.location.search).get("token") || "";
 function apiUrl(path) { return token ? `${path}?token=${encodeURIComponent(token)}` : path; }
 let secLeft = 3;
 
+function fmtPx(v) {
+  const n = Number(v);
+  if (Number.isNaN(n)) return "--";
+  return Math.abs(n) < 50 ? n.toFixed(4) : n.toFixed(2);
+}
+
 async function fetchState() {
   try {
     const res = await fetch("/api/state");
     const data = await res.json();
     document.getElementById("istClock").textContent = data.server_time_ist;
     document.getElementById("modeBadge").textContent = data.mode;
+    const pinnedStr = (data.pinned_symbols || []).join(", ");
+    document.getElementById("universeLabel").textContent =
+      `Top ${data.top_n_coins || 100} Gate USDT Perps · ${data.max_pairs_per_cycle || 25}/cycle` + (pinnedStr ? ` · Pins: ${pinnedStr}` : "");
 
     const st = document.getElementById("statusBadge");
     const tBtn = document.getElementById("toggleBtn");
@@ -1433,16 +1251,20 @@ async function fetchState() {
       tBtn.textContent = "Pause Bot"; tBtn.className = "btn-warn";
     }
 
+    const activeTrades = data.active_trades || [];
+    const maxPos = data.max_open_positions || 2;
+    document.getElementById("slotsVal").textContent = `${activeTrades.length} / ${maxPos}`;
+
     const scan = data.last_scan;
     if (scan) {
-      document.getElementById("scanSpot").textContent = scan.spot !== null && scan.spot !== undefined ? Number(scan.spot).toFixed(2) : "--";
-      document.getElementById("scanEma").textContent = scan.ema_50 !== null && scan.ema_50 !== undefined ? Number(scan.ema_50).toFixed(2) : "--";
-      document.getElementById("scanRegime").textContent = scan.spread_label || "--";
-      document.getElementById("scanRatio").textContent = scan.credit_ratio_pct !== null && scan.credit_ratio_pct !== undefined ? `${Number(scan.credit_ratio_pct).toFixed(2)}%` : "--";
       document.getElementById("scanTime").textContent = scan.checked_at_ist || "--";
       const rEl = document.getElementById("scanReason");
       rEl.textContent = `[${scan.status || "INFO"}] ${scan.reason || ""}`;
       rEl.style.color = scan.status === "OPENED" ? "var(--green)" : (scan.status === "ERROR" ? "var(--red)" : "var(--amber)");
+      const ps = scan.pair_summaries || [];
+      document.getElementById("pairSummaries").innerHTML = ps.map(p =>
+        `<div><code>${p.symbol}</code> — ${p.detail}</div>`
+      ).join("");
     }
 
     const stats = data.stats || {};
@@ -1461,39 +1283,40 @@ async function fetchState() {
       document.getElementById("pinSecInput").value = data.pin_interval_sec;
     }
 
-    const t = data.active_trade;
     const liveEl = document.getElementById("livePnl");
-    if (t) {
-      document.getElementById("activeSpreadType").textContent = t.spread_label || "Credit Spread";
+    const listEl = document.getElementById("tradesList");
+    if (activeTrades.length > 0) {
       document.getElementById("noTradeMsg").style.display = "none";
-      document.getElementById("tradePanel").style.display = "block";
-      document.getElementById("shortSym").textContent = t.short_sym;
-      document.getElementById("longSym").textContent = t.long_sym;
-      document.getElementById("shortStrike").textContent = t.short_strike;
-      document.getElementById("longStrike").textContent = t.long_strike;
-      document.getElementById("shortFill").textContent = Number(t.short_fill_price || 0).toFixed(4);
-      document.getElementById("longFill").textContent = Number(t.long_fill_price || 0).toFixed(4);
-      document.getElementById("shortDelta").textContent = t.short_delta !== null ? t.short_delta.toFixed(3) : "N/A";
-      document.getElementById("longDelta").textContent = t.long_delta !== null ? t.long_delta.toFixed(3) : "N/A";
-      document.getElementById("entryCredit").textContent = Number(t.entry_credit || 0).toFixed(4);
-      document.getElementById("maxLoss").textContent = Number(t.max_loss || 0).toFixed(4);
-      document.getElementById("hoursLeft").textContent = t.hours_left;
-      document.getElementById("remPct").textContent = t.remaining_pct;
-      document.getElementById("holdBar").style.width = `${t.remaining_pct}%`;
+      const totU = Number(data.total_unrealized_pnl || 0);
+      liveEl.textContent = (totU >= 0 ? "+" : "") + totU.toFixed(4);
+      liveEl.className = "val " + (totU >= 0 ? "pos" : "neg");
 
-      if (t.unrealized_pnl !== null) {
-        const u = Number(t.unrealized_pnl);
-        liveEl.textContent = (u >= 0 ? "+" : "") + u.toFixed(4);
-        liveEl.className = "val " + (u >= 0 ? "pos" : "neg");
-      } else {
-        liveEl.textContent = "Quote N/A"; liveEl.className = "val";
-      }
+      listEl.innerHTML = activeTrades.map(t => {
+        const u = Number(t.unrealized_pnl || 0);
+        const uCls = u >= 0 ? "pos" : "neg";
+        return `<div class="pos-item">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <div><code>${t.symbol}</code> <b>${(t.side || "").toUpperCase()}</b> × <code>${t.amount}</code></div>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <span class="${uCls}"><b>PnL: ${(u >= 0 ? "+" : "") + u.toFixed(4)} USDT</b></span>
+              <button class="btn-danger" style="padding:5px 10px; font-size:0.78rem;" onclick="closeSinglePosition(this, ${JSON.stringify(t.symbol)})">Close</button>
+            </div>
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:14px; margin-top:8px; font-size:0.84rem; color:var(--muted);">
+            <span>Entry: <b style="color:var(--text);">${fmtPx(t.entry_price)}</b></span>
+            <span>Mark: <b style="color:var(--text);">${t.mark_price !== null ? fmtPx(t.mark_price) : "--"}</b></span>
+            <span>Stop: <b style="color:var(--amber);">${fmtPx(t.stop_price)}</b></span>
+            <span>TP: <b style="color:var(--green);">${fmtPx(t.tp_price)}</b></span>
+            <span style="margin-left:auto;">Hold left: <b>${t.hours_left}h</b> (${t.remaining_pct}%)</span>
+          </div>
+          <div class="bar-bg"><div class="bar-fill" style="width:${t.remaining_pct}%;"></div></div>
+        </div>`;
+      }).join("");
     } else {
-      document.getElementById("activeSpreadType").textContent = "Flat";
       document.getElementById("noTradeMsg").style.display = "block";
-      document.getElementById("tradePanel").style.display = "none";
-      liveEl.textContent = "Flat"; liveEl.className = "val";
-      document.getElementById("maxLoss").textContent = "--";
+      listEl.innerHTML = "";
+      liveEl.textContent = "Flat";
+      liveEl.className = "val";
     }
 
     const hist = data.trade_history || [];
@@ -1505,13 +1328,11 @@ async function fetchState() {
         const pnlVal = Number(row.realized_pnl || 0);
         const cls = pnlVal >= 0 ? "pos" : "neg";
         const pnlStr = (pnlVal >= 0 ? "+" : "") + pnlVal.toFixed(4);
-        const sdStr = (row.short_delta !== null && row.short_delta !== undefined) ? Number(row.short_delta).toFixed(3) : "N/A";
-        const ldStr = (row.long_delta !== null && row.long_delta !== undefined) ? Number(row.long_delta).toFixed(3) : "N/A";
         return `<tr>
           <td><code>${row.entry_ist}</code> → <code>${row.exit_ist}</code></td>
-          <td>${row.spread_label || "Spread"}</td>
-          <td><b>${row.short_strike ?? "--"}</b> / ${row.long_strike ?? "--"}</td>
-          <td><code>${sdStr}</code> / <code>${ldStr}</code></td>
+          <td><code>${row.symbol || "--"}</code></td>
+          <td><b>${(row.side || "").toUpperCase()}</b></td>
+          <td>${fmtPx(row.entry_price)} → ${fmtPx(row.exit_price)}</td>
           <td>${row.exit_reason || "--"}</td>
           <td class="${cls}"><b>${pnlStr}</b></td>
         </tr>`;
@@ -1522,6 +1343,26 @@ async function fetchState() {
     }
   } catch (err) {
     console.error("State fetch error:", err);
+  }
+}
+
+async function closeSinglePosition(btn, symbol) {
+  if (!confirm(`Close ${symbol} position now? Bot will remain running.`)) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Closing...";
+  try {
+    const qs = new URLSearchParams({ symbol });
+    if (token) qs.set("token", token);
+    const res = await fetch(`/api/close-position?${qs.toString()}`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.detail || `Failed to close ${symbol}`);
+    }
+    await fetchState();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
   }
 }
 
@@ -1548,7 +1389,7 @@ async function updatePinSec() {
   fetchState();
 }
 async function emergencyCloseAll() {
-  if (!confirm("Close all open option legs immediately and pause the bot?")) return;
+  if (!confirm("Close all open positions immediately and pause the bot?")) return;
   await fetch(apiUrl("/api/closeall"), { method: "POST" });
   fetchState();
 }
@@ -1584,16 +1425,17 @@ def run_bot():
     threading.Thread(target=start_web_ui, daemon=True).start()
 
     cached_markets = exchange.load_markets()
+    get_top_gate_perp_symbols(cached_markets, force_refresh=True)
     state = load_state()
 
     send_telegram(
-        f"<b>Bull/Bear Credit Spread Bot Started</b>\n"
+        f"<b>ATR Top-{TOP_N_COINS} Bot Started</b>\n"
         f"Mode: <code>{'TESTNET' if USE_TESTNET else 'LIVE'}</code> | "
-        f"State: <code>{'PAUSED' if state['paused'] else 'RUNNING'}</code>\n"
-        f"Web UI Port: <code>{WEB_UI_PORT}</code>"
+        f"Max Positions: <code>{MAX_OPEN_POSITIONS}</code> | Slice: <code>{MAX_PAIRS_PER_CYCLE}/cycle</code>\n"
+        f"Risk/Trade: <code>{RISK_PER_TRADE_USDT:.2f} USDT</code> | Port: <code>{WEB_UI_PORT}</code>"
     )
     ensure_and_update_pinned_card(force_new=False)
-    logging.info(f"Credit Spread Bot started on port {WEB_UI_PORT}.")
+    logging.info(f"ATR Top-{TOP_N_COINS} Bot started on port {WEB_UI_PORT}.")
 
     while True:
         perform_scan_cycle(cached_markets)
