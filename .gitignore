@@ -1,7 +1,38 @@
-.env
-bot_state.json
-bot_state.json.tmp
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments & local tooling
 .venv/
 venv/
+ENV/
+env/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Bot runtime state, trade history & logs
+*.log
+*.json
+!package.json
+!package-lock.json
+*.csv
+*.db
+*.sqlite3
+redis_data/
+dump.rdb
+
+# OS & archive artifacts
+.DS_Store
+Thumbs.db
+*.zip
+*.tar.gz
