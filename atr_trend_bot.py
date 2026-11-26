@@ -40,12 +40,8 @@ WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("PORT") or os.getenv("WEB_UI_PORT") or "8080")
 WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "").strip()
 
-# 24/7 Supervisor & Server Sleep Stop Settings
+# 24/7 Supervisor Settings
 SUPERVISOR_RESTART_DELAY_SEC = float(os.getenv("SUPERVISOR_RESTART_DELAY_SEC", "5.0"))
-SLEEP_STOP_ENABLED = os.getenv("SLEEP_STOP_ENABLED", "true").lower() == "true"
-SLEEP_GAP_STOP_SEC = int(os.getenv("SLEEP_GAP_STOP_SEC", "300"))
-AUTO_PAUSE_ON_SLEEP_STOP = os.getenv("AUTO_PAUSE_ON_SLEEP_STOP", "true").lower() == "true"
-CLOSE_ON_SLEEP_STOP = os.getenv("CLOSE_ON_SLEEP_STOP", "false").lower() == "true"
 
 # Universe, Rotation, Slots & Capital Settings
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
@@ -151,9 +147,6 @@ def load_state() -> dict:
             data.setdefault("total_capital_usdt", TOTAL_CAPITAL_USDT)
             data.setdefault("pullback_atr_band", PULLBACK_ATR_BAND)
             data.setdefault("risk_per_trade_usdt", RISK_PER_TRADE_USDT)
-            data.setdefault("last_heartbeat_ts", None)
-            data.setdefault("sleep_stop_triggered", False)
-            data.setdefault("last_sleep_event", None)
             return data
         except json.JSONDecodeError:
             logging.error("Corrupted Redis state JSON; resetting to default.")
@@ -168,9 +161,6 @@ def load_state() -> dict:
         "total_capital_usdt": TOTAL_CAPITAL_USDT,
         "pullback_atr_band": PULLBACK_ATR_BAND,
         "risk_per_trade_usdt": RISK_PER_TRADE_USDT,
-        "last_heartbeat_ts": None,
-        "sleep_stop_triggered": False,
-        "last_sleep_event": None,
     }
 
 
@@ -581,7 +571,6 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     trades = state.get("active_trades") or []
     cap_info = calc_capital_summary(trades, active_total_cap)
     last_scan = state.get("last_scan")
-    sleep_ev = state.get("last_sleep_event")
 
     if trades:
         lines = [f"<b>Active Positions ({len(trades)}/{active_max_slots}):</b>"]
@@ -611,11 +600,6 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     losses = int(stats.get("losses", 0))
     win_rate = (wins / total * 100.0) if total > 0 else 0.0
     realized = float(stats.get("realized_pnl", 0.0))
-    sleep_line = (
-        f"\n<b>Sleep Stop:</b> <code>{sleep_ev.get('gap_sec')}s</code> gap @ <code>{sleep_ev.get('detected_ist')}</code>"
-        if sleep_ev
-        else ""
-    )
 
     return (
         f"<b>ATR Top-{TOP_N_COINS} [{mode_label()}] [{status_flag}]</b>\n"
@@ -624,7 +608,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
         f"<code>{cap_info['total_capital_usdt']:.2f} USDT</code> ({cap_info['capital_used_pct']}%)\n"
         f"<b>Realized Stats:</b> {wins}W / {losses}L ({win_rate:.1f}%) | "
         f"PnL: <code>{realized:+.4f}</code>\n"
-        f"<b>Params:</b> Band <code>{band}</code> · Risk <code>{risk_usdt:.2f} USDT</code>{sleep_line}\n"
+        f"<b>Params:</b> Band <code>{band}</code> · Risk <code>{risk_usdt:.2f} USDT</code>\n"
         f"<i>Refresh: {pin_sec}s · {now_ist}</i>"
     )
 
@@ -757,82 +741,6 @@ def close_all_positions_now(reason: str) -> tuple[int, float]:
     return closed_count, total_pnl
 
 
-# ==========================================
-# SERVER SLEEP STOP HANDLER
-# ==========================================
-def trigger_sleep_stop(gap_sec: int, source: str = "Sleep/Restart Gap") -> dict:
-    now_ist = datetime.now(IST).strftime("%d %b %H:%M:%S IST")
-    event = {
-        "gap_sec": int(max(0, gap_sec)),
-        "source": source,
-        "detected_ist": now_ist,
-        "auto_paused": bool(AUTO_PAUSE_ON_SLEEP_STOP),
-        "closed_positions": False,
-    }
-
-    with state_lock:
-        state = load_state()
-        state["sleep_stop_triggered"] = True
-        state["last_sleep_event"] = event
-        if AUTO_PAUSE_ON_SLEEP_STOP:
-            state["paused"] = True
-        save_state(state)
-
-    logging.warning(
-        f"[SLEEP STOP] Detected {gap_sec}s gap ({source}). "
-        f"paused={AUTO_PAUSE_ON_SLEEP_STOP}, close_on_sleep={CLOSE_ON_SLEEP_STOP}"
-    )
-
-    if CLOSE_ON_SLEEP_STOP:
-        closed_cnt, total_pnl = close_all_positions_now(f"Server Sleep Stop ({gap_sec}s)")
-        event["closed_positions"] = True
-        event["closed_count"] = closed_cnt
-        event["closed_pnl"] = round(total_pnl, 4)
-        with state_lock:
-            state = load_state()
-            state["last_sleep_event"] = event
-            save_state(state)
-
-    send_telegram(
-        f"<b>Server Sleep Stop Triggered</b>\n"
-        f"Gap: <code>{gap_sec}s</code> ({source})\n"
-        f"New Entries: <code>{'PAUSED' if AUTO_PAUSE_ON_SLEEP_STOP else 'ACTIVE'}</code> · "
-        f"Positions Closed: <code>{'YES' if CLOSE_ON_SLEEP_STOP else 'NO'}</code>\n"
-        f"<i>{now_ist}</i>"
-    )
-    ensure_and_update_pinned_card(force_new=False)
-    return event
-
-
-def clear_sleep_stop(resume_bot: bool = False) -> dict:
-    with state_lock:
-        state = load_state()
-        state["sleep_stop_triggered"] = False
-        if resume_bot:
-            state["paused"] = False
-        save_state(state)
-        paused = bool(state.get("paused", False))
-    ensure_and_update_pinned_card(force_new=False)
-    return {"ok": True, "sleep_stop_triggered": False, "paused": paused}
-
-
-def check_and_record_heartbeat(now_ts: float | None = None) -> dict | None:
-    ts = time.time() if now_ts is None else float(now_ts)
-    with state_lock:
-        state = load_state()
-        prev_ts = state.get("last_heartbeat_ts")
-        state["last_heartbeat_ts"] = ts
-        save_state(state)
-
-    if prev_ts is None or not SLEEP_STOP_ENABLED:
-        return None
-
-    gap = ts - float(prev_ts)
-    if gap >= SLEEP_GAP_STOP_SEC:
-        return trigger_sleep_stop(int(gap), "Heartbeat/Cycle Gap")
-    return None
-
-
 def telegram_command_worker():
     if not _tg_configured():
         logging.warning("Telegram token not configured; command listener disabled.")
@@ -898,14 +806,6 @@ def telegram_command_worker():
                         f"<i>{scan.get('checked_at_ist', '--')}</i>"
                     )
 
-                elif cmd == "/sleepstop":
-                    parts = text.split()
-                    if len(parts) > 1 and parts[1].lower() in ("clear", "reset", "off"):
-                        clear_sleep_stop(resume_bot=False)
-                        send_telegram("<b>Sleep Stop Cleared.</b> Use <code>/resume</code> when ready to scan.")
-                    else:
-                        trigger_sleep_stop(0, "Manual /sleepstop")
-
                 elif cmd == "/setslots":
                     parts = text.split()
                     if len(parts) < 2 or not parts[1].isdigit():
@@ -936,7 +836,6 @@ def telegram_command_worker():
                     with state_lock:
                         state = load_state()
                         state["paused"] = False
-                        state["sleep_stop_triggered"] = False
                         save_state(state)
                     send_telegram("<b>Bot Resumed.</b> Scanning Top-100 slice for setups.")
                     ensure_and_update_pinned_card(force_new=False)
@@ -985,13 +884,10 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
             cached_markets = active_markets
 
         try:
-            check_and_record_heartbeat()
-
             with state_lock:
                 state = load_state()
                 trades = list(state.get("active_trades") or [])
                 paused = bool(state.get("paused", False))
-                sleep_stop_active = bool(state.get("sleep_stop_triggered", False))
                 active_max_slots, _ = get_runtime_capacity_params(state)
                 pullback_band, risk_usdt = get_runtime_strategy_params(state)
 
@@ -1062,10 +958,6 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
             if stop_event.is_set():
                 msg = "Shutdown requested; skipping new entries."
                 record_scan_diagnostics("STOPPING", msg)
-            elif sleep_stop_active and AUTO_PAUSE_ON_SLEEP_STOP:
-                msg = f"Server Sleep Stop active ({open_count}/{active_max_slots} open). Resume bot after wake check."
-                logging.info(f"[SCAN] {msg}")
-                record_scan_diagnostics("SLEEP_STOP", msg)
             elif paused:
                 msg = f"Bot is PAUSED ({open_count}/{active_max_slots} open). Skipping new entries."
                 logging.info(f"[SCAN] {msg}")
@@ -1270,7 +1162,6 @@ def healthz():
     with state_lock:
         st = load_state()
         paused = bool(st.get("paused", False))
-        sleep_stop = bool(st.get("sleep_stop_triggered", False))
         trades = st.get("active_trades") or []
         active_cnt = len(trades)
         active_max_slots, active_total_cap = get_runtime_capacity_params(st)
@@ -1289,8 +1180,6 @@ def healthz():
         **cap_info,
         "pullback_atr_band": band,
         "risk_per_trade_usdt": risk_usdt,
-        "sleep_stop_enabled": SLEEP_STOP_ENABLED,
-        "sleep_stop_triggered": sleep_stop,
         "paused": paused,
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
     }
@@ -1355,8 +1244,6 @@ def api_state():
         **cap_info,
         "pullback_atr_band": active_band,
         "risk_per_trade_usdt": active_risk,
-        "sleep_stop_triggered": bool(state.get("sleep_stop_triggered", False)),
-        "last_sleep_event": state.get("last_sleep_event"),
         "paused": bool(state.get("paused", False)),
         "pin_interval_sec": int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)),
         "last_scan": state.get("last_scan"),
@@ -1453,8 +1340,6 @@ def api_toggle_pause(token: str | None = None):
     with state_lock:
         state = load_state()
         state["paused"] = not bool(state.get("paused", False))
-        if not state["paused"]:
-            state["sleep_stop_triggered"] = False
         save_state(state)
         paused = state["paused"]
     send_telegram(f"<b>Web UI:</b> Bot is now <b>{'PAUSED' if paused else 'RUNNING'}</b>.")
