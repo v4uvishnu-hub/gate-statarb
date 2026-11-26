@@ -1,6 +1,8 @@
 import os
+import sys
 import json
 import time
+import signal
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -37,6 +39,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("PORT") or os.getenv("WEB_UI_PORT") or "8080")
 WEB_UI_TOKEN = os.getenv("WEB_UI_TOKEN", "").strip()
+
+# 24/7 Supervisor & Server Sleep Stop Settings
+SUPERVISOR_RESTART_DELAY_SEC = float(os.getenv("SUPERVISOR_RESTART_DELAY_SEC", "5.0"))
+SLEEP_STOP_ENABLED = os.getenv("SLEEP_STOP_ENABLED", "true").lower() == "true"
+SLEEP_GAP_STOP_SEC = int(os.getenv("SLEEP_GAP_STOP_SEC", "300"))
+AUTO_PAUSE_ON_SLEEP_STOP = os.getenv("AUTO_PAUSE_ON_SLEEP_STOP", "true").lower() == "true"
+CLOSE_ON_SLEEP_STOP = os.getenv("CLOSE_ON_SLEEP_STOP", "false").lower() == "true"
 
 # Universe, Rotation, Slots & Capital Settings
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "100"))
@@ -82,8 +91,9 @@ logging.basicConfig(
 )
 
 # ==========================================
-# CLIENTS, THREAD LOCKS & MARKET CACHE
+# CLIENTS, THREAD LOCKS & SHUTDOWN EVENT
 # ==========================================
+stop_event = threading.Event()
 state_lock = threading.Lock()
 scan_lock = threading.Lock()
 universe_lock = threading.Lock()
@@ -91,11 +101,13 @@ universe_lock = threading.Lock()
 cached_markets: dict = {}
 cached_top_symbols: list[str] = list(PINNED_SYMBOLS)
 last_universe_refresh_ts: float = 0.0
+_warned_missing_chat_id = False
 
-rds = redis.from_url(REDIS_URL, decode_responses=True)
+rds = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
 
 exchange_cfg: dict = {
     "enableRateLimit": True,
+    "timeout": 20000,
     "options": {"defaultType": "swap"},
 }
 if HAS_PRIVATE_KEYS:
@@ -111,6 +123,10 @@ def mode_label() -> str:
     if PAPER_MODE:
         return "PUBLIC-PAPER"
     return "TESTNET" if USE_TESTNET else "LIVE"
+
+
+def _sleep_interruptible(seconds: float):
+    stop_event.wait(timeout=max(0.1, float(seconds)))
 
 
 # ==========================================
@@ -135,6 +151,9 @@ def load_state() -> dict:
             data.setdefault("total_capital_usdt", TOTAL_CAPITAL_USDT)
             data.setdefault("pullback_atr_band", PULLBACK_ATR_BAND)
             data.setdefault("risk_per_trade_usdt", RISK_PER_TRADE_USDT)
+            data.setdefault("last_heartbeat_ts", None)
+            data.setdefault("sleep_stop_triggered", False)
+            data.setdefault("last_sleep_event", None)
             return data
         except json.JSONDecodeError:
             logging.error("Corrupted Redis state JSON; resetting to default.")
@@ -149,6 +168,9 @@ def load_state() -> dict:
         "total_capital_usdt": TOTAL_CAPITAL_USDT,
         "pullback_atr_band": PULLBACK_ATR_BAND,
         "risk_per_trade_usdt": RISK_PER_TRADE_USDT,
+        "last_heartbeat_ts": None,
+        "sleep_stop_triggered": False,
+        "last_sleep_event": None,
     }
 
 
@@ -496,16 +518,28 @@ def _tg_configured() -> bool:
     return bool(TELEGRAM_BOT_TOKEN)
 
 
+def _has_default_chat_id() -> bool:
+    global _warned_missing_chat_id
+    if TELEGRAM_CHAT_ID:
+        return True
+    if not _warned_missing_chat_id:
+        logging.warning("TELEGRAM_CHAT_ID is empty; skipping broadcast/pinned Telegram messages (/chatid still works).")
+        _warned_missing_chat_id = True
+    return False
+
+
 def _tg_api(method: str, payload: dict):
     if not _tg_configured():
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     for _ in range(3):
+        if stop_event.is_set():
+            return None
         try:
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code == 429:
                 retry_after = float(resp.json().get("parameters", {}).get("retry_after", 3))
-                time.sleep(max(1.0, retry_after))
+                _sleep_interruptible(max(1.0, retry_after))
                 continue
             data = resp.json()
             if not resp.ok or not data.get("ok"):
@@ -514,7 +548,7 @@ def _tg_api(method: str, payload: dict):
             return data.get("result")
         except Exception as e:
             logging.error(f"Telegram {method} request error: {e}")
-            time.sleep(2)
+            _sleep_interruptible(2)
     return None
 
 
@@ -533,6 +567,8 @@ def send_telegram_to(chat_id: str, text: str):
 
 
 def send_telegram(text: str):
+    if not _has_default_chat_id():
+        return
     send_telegram_to(str(TELEGRAM_CHAT_ID), text)
 
 
@@ -545,6 +581,7 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     trades = state.get("active_trades") or []
     cap_info = calc_capital_summary(trades, active_total_cap)
     last_scan = state.get("last_scan")
+    sleep_ev = state.get("last_sleep_event")
 
     if trades:
         lines = [f"<b>Active Positions ({len(trades)}/{active_max_slots}):</b>"]
@@ -574,6 +611,11 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
     losses = int(stats.get("losses", 0))
     win_rate = (wins / total * 100.0) if total > 0 else 0.0
     realized = float(stats.get("realized_pnl", 0.0))
+    sleep_line = (
+        f"\n<b>Sleep Stop:</b> <code>{sleep_ev.get('gap_sec')}s</code> gap @ <code>{sleep_ev.get('detected_ist')}</code>"
+        if sleep_ev
+        else ""
+    )
 
     return (
         f"<b>ATR Top-{TOP_N_COINS} [{mode_label()}] [{status_flag}]</b>\n"
@@ -582,13 +624,13 @@ def build_pinned_status_text(state: dict, stats: dict) -> str:
         f"<code>{cap_info['total_capital_usdt']:.2f} USDT</code> ({cap_info['capital_used_pct']}%)\n"
         f"<b>Realized Stats:</b> {wins}W / {losses}L ({win_rate:.1f}%) | "
         f"PnL: <code>{realized:+.4f}</code>\n"
-        f"<b>Params:</b> Band <code>{band}</code> · Risk <code>{risk_usdt:.2f} USDT</code>\n"
+        f"<b>Params:</b> Band <code>{band}</code> · Risk <code>{risk_usdt:.2f} USDT</code>{sleep_line}\n"
         f"<i>Refresh: {pin_sec}s · {now_ist}</i>"
     )
 
 
 def ensure_and_update_pinned_card(force_new: bool = False):
-    if not _tg_configured():
+    if not _tg_configured() or not _has_default_chat_id():
         return
 
     with state_lock:
@@ -638,7 +680,7 @@ def ensure_and_update_pinned_card(force_new: bool = False):
 
 def pinned_card_worker():
     logging.info("Pinned Telegram status card worker started.")
-    while True:
+    while not stop_event.is_set():
         try:
             ensure_and_update_pinned_card(force_new=False)
         except Exception as e:
@@ -646,7 +688,7 @@ def pinned_card_worker():
 
         with state_lock:
             interval = int(load_state().get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC))
-        time.sleep(max(PIN_INTERVAL_MIN_SEC, interval))
+        _sleep_interruptible(max(PIN_INTERVAL_MIN_SEC, interval))
 
 
 def close_single_position(trade: dict, reason: str, exit_price_hint: float | None = None) -> float:
@@ -715,6 +757,82 @@ def close_all_positions_now(reason: str) -> tuple[int, float]:
     return closed_count, total_pnl
 
 
+# ==========================================
+# SERVER SLEEP STOP HANDLER
+# ==========================================
+def trigger_sleep_stop(gap_sec: int, source: str = "Sleep/Restart Gap") -> dict:
+    now_ist = datetime.now(IST).strftime("%d %b %H:%M:%S IST")
+    event = {
+        "gap_sec": int(max(0, gap_sec)),
+        "source": source,
+        "detected_ist": now_ist,
+        "auto_paused": bool(AUTO_PAUSE_ON_SLEEP_STOP),
+        "closed_positions": False,
+    }
+
+    with state_lock:
+        state = load_state()
+        state["sleep_stop_triggered"] = True
+        state["last_sleep_event"] = event
+        if AUTO_PAUSE_ON_SLEEP_STOP:
+            state["paused"] = True
+        save_state(state)
+
+    logging.warning(
+        f"[SLEEP STOP] Detected {gap_sec}s gap ({source}). "
+        f"paused={AUTO_PAUSE_ON_SLEEP_STOP}, close_on_sleep={CLOSE_ON_SLEEP_STOP}"
+    )
+
+    if CLOSE_ON_SLEEP_STOP:
+        closed_cnt, total_pnl = close_all_positions_now(f"Server Sleep Stop ({gap_sec}s)")
+        event["closed_positions"] = True
+        event["closed_count"] = closed_cnt
+        event["closed_pnl"] = round(total_pnl, 4)
+        with state_lock:
+            state = load_state()
+            state["last_sleep_event"] = event
+            save_state(state)
+
+    send_telegram(
+        f"<b>Server Sleep Stop Triggered</b>\n"
+        f"Gap: <code>{gap_sec}s</code> ({source})\n"
+        f"New Entries: <code>{'PAUSED' if AUTO_PAUSE_ON_SLEEP_STOP else 'ACTIVE'}</code> · "
+        f"Positions Closed: <code>{'YES' if CLOSE_ON_SLEEP_STOP else 'NO'}</code>\n"
+        f"<i>{now_ist}</i>"
+    )
+    ensure_and_update_pinned_card(force_new=False)
+    return event
+
+
+def clear_sleep_stop(resume_bot: bool = False) -> dict:
+    with state_lock:
+        state = load_state()
+        state["sleep_stop_triggered"] = False
+        if resume_bot:
+            state["paused"] = False
+        save_state(state)
+        paused = bool(state.get("paused", False))
+    ensure_and_update_pinned_card(force_new=False)
+    return {"ok": True, "sleep_stop_triggered": False, "paused": paused}
+
+
+def check_and_record_heartbeat(now_ts: float | None = None) -> dict | None:
+    ts = time.time() if now_ts is None else float(now_ts)
+    with state_lock:
+        state = load_state()
+        prev_ts = state.get("last_heartbeat_ts")
+        state["last_heartbeat_ts"] = ts
+        save_state(state)
+
+    if prev_ts is None or not SLEEP_STOP_ENABLED:
+        return None
+
+    gap = ts - float(prev_ts)
+    if gap >= SLEEP_GAP_STOP_SEC:
+        return trigger_sleep_stop(int(gap), "Heartbeat/Cycle Gap")
+    return None
+
+
 def telegram_command_worker():
     if not _tg_configured():
         logging.warning("Telegram token not configured; command listener disabled.")
@@ -725,15 +843,15 @@ def telegram_command_worker():
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     logging.info("Telegram command listener started.")
 
-    while True:
+    while not stop_event.is_set():
         try:
-            params = {"timeout": 25}
+            params = {"timeout": 20}
             if offset is not None:
                 params["offset"] = offset
-            resp = requests.get(base_url, params=params, timeout=30)
+            resp = requests.get(base_url, params=params, timeout=25)
             if resp.status_code != 200:
                 logging.warning(f"Telegram getUpdates HTTP {resp.status_code}: {resp.text[:200]}")
-                time.sleep(3)
+                _sleep_interruptible(3)
                 continue
 
             for upd in resp.json().get("result", []):
@@ -780,6 +898,14 @@ def telegram_command_worker():
                         f"<i>{scan.get('checked_at_ist', '--')}</i>"
                     )
 
+                elif cmd == "/sleepstop":
+                    parts = text.split()
+                    if len(parts) > 1 and parts[1].lower() in ("clear", "reset", "off"):
+                        clear_sleep_stop(resume_bot=False)
+                        send_telegram("<b>Sleep Stop Cleared.</b> Use <code>/resume</code> when ready to scan.")
+                    else:
+                        trigger_sleep_stop(0, "Manual /sleepstop")
+
                 elif cmd == "/setslots":
                     parts = text.split()
                     if len(parts) < 2 or not parts[1].isdigit():
@@ -810,6 +936,7 @@ def telegram_command_worker():
                     with state_lock:
                         state = load_state()
                         state["paused"] = False
+                        state["sleep_stop_triggered"] = False
                         save_state(state)
                     send_telegram("<b>Bot Resumed.</b> Scanning Top-100 slice for setups.")
                     ensure_and_update_pinned_card(force_new=False)
@@ -843,7 +970,7 @@ def telegram_command_worker():
 
         except Exception as e:
             logging.error(f"Telegram polling error: {e}")
-            time.sleep(5)
+            _sleep_interruptible(5)
 
 
 # ==========================================
@@ -858,15 +985,21 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
             cached_markets = active_markets
 
         try:
+            check_and_record_heartbeat()
+
             with state_lock:
                 state = load_state()
                 trades = list(state.get("active_trades") or [])
                 paused = bool(state.get("paused", False))
+                sleep_stop_active = bool(state.get("sleep_stop_triggered", False))
                 active_max_slots, _ = get_runtime_capacity_params(state)
                 pullback_band, risk_usdt = get_runtime_strategy_params(state)
 
             updated_trades: list[dict] = []
             for tr in trades:
+                if stop_event.is_set():
+                    updated_trades.append(tr)
+                    continue
                 sym = tr["symbol"]
                 try:
                     snap = fetch_market_snapshot(sym)
@@ -926,7 +1059,14 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
             open_count = len(updated_trades)
             open_syms = {t["symbol"] for t in updated_trades}
 
-            if paused:
+            if stop_event.is_set():
+                msg = "Shutdown requested; skipping new entries."
+                record_scan_diagnostics("STOPPING", msg)
+            elif sleep_stop_active and AUTO_PAUSE_ON_SLEEP_STOP:
+                msg = f"Server Sleep Stop active ({open_count}/{active_max_slots} open). Resume bot after wake check."
+                logging.info(f"[SCAN] {msg}")
+                record_scan_diagnostics("SLEEP_STOP", msg)
+            elif paused:
                 msg = f"Bot is PAUSED ({open_count}/{active_max_slots} open). Skipping new entries."
                 logging.info(f"[SCAN] {msg}")
                 record_scan_diagnostics("PAUSED", msg)
@@ -946,7 +1086,7 @@ def perform_scan_cycle(markets: dict | None = None) -> dict:
                 checked_count = 0
 
                 for sym in scan_symbols:
-                    if sym in open_syms:
+                    if stop_event.is_set() or sym in open_syms:
                         continue
                     if len(open_syms) >= active_max_slots:
                         break
@@ -1120,6 +1260,8 @@ def _fmt_ist(iso_str: str | None) -> str:
 
 @app.get("/healthz")
 def healthz():
+    if stop_event.is_set():
+        raise HTTPException(status_code=503, detail="Shutting down")
     redis_ok = False
     try:
         redis_ok = bool(rds.ping())
@@ -1128,6 +1270,7 @@ def healthz():
     with state_lock:
         st = load_state()
         paused = bool(st.get("paused", False))
+        sleep_stop = bool(st.get("sleep_stop_triggered", False))
         trades = st.get("active_trades") or []
         active_cnt = len(trades)
         active_max_slots, active_total_cap = get_runtime_capacity_params(st)
@@ -1146,6 +1289,8 @@ def healthz():
         **cap_info,
         "pullback_atr_band": band,
         "risk_per_trade_usdt": risk_usdt,
+        "sleep_stop_enabled": SLEEP_STOP_ENABLED,
+        "sleep_stop_triggered": sleep_stop,
         "paused": paused,
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
     }
@@ -1210,6 +1355,8 @@ def api_state():
         **cap_info,
         "pullback_atr_band": active_band,
         "risk_per_trade_usdt": active_risk,
+        "sleep_stop_triggered": bool(state.get("sleep_stop_triggered", False)),
+        "last_sleep_event": state.get("last_sleep_event"),
         "paused": bool(state.get("paused", False)),
         "pin_interval_sec": int(state.get("pin_interval_sec", PIN_INTERVAL_DEFAULT_SEC)),
         "last_scan": state.get("last_scan"),
@@ -1306,6 +1453,8 @@ def api_toggle_pause(token: str | None = None):
     with state_lock:
         state = load_state()
         state["paused"] = not bool(state.get("paused", False))
+        if not state["paused"]:
+            state["sleep_stop_triggered"] = False
         save_state(state)
         paused = state["paused"]
     send_telegram(f"<b>Web UI:</b> Bot is now <b>{'PAUSED' if paused else 'RUNNING'}</b>.")
@@ -1342,7 +1491,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>ATR Top-100 Bot (Public API)</title>
+<title>ATR Top-100 Bot (24/7)</title>
 <style>
   :root {
     --bg: #0b0f17; --card: #131a26; --border: #222d40;
@@ -1873,7 +2022,32 @@ def dashboard_page():
 
 
 def start_web_ui():
-    uvicorn.run(app, host=WEB_UI_HOST, port=WEB_UI_PORT, log_level="warning")
+    config = uvicorn.Config(
+        app,
+        host=WEB_UI_HOST,
+        port=WEB_UI_PORT,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = False
+    server.run()
+
+
+def _run_supervised(name: str, target_fn):
+    while not stop_event.is_set():
+        try:
+            target_fn()
+        except Exception as e:
+            logging.error(f"Supervisor caught error in [{name}]: {e}")
+        if stop_event.is_set():
+            break
+        logging.warning(f"Restarting [{name}] in {SUPERVISOR_RESTART_DELAY_SEC}s...")
+        _sleep_interruptible(SUPERVISOR_RESTART_DELAY_SEC)
+
+
+def _handle_shutdown_signal(signum, _frame):
+    logging.info(f"Received signal {signum}; initiating clean shutdown...")
+    stop_event.set()
 
 
 # ==========================================
@@ -1881,14 +2055,40 @@ def start_web_ui():
 # ==========================================
 def run_bot():
     global cached_markets
-    threading.Thread(target=telegram_command_worker, daemon=True).start()
-    threading.Thread(target=pinned_card_worker, daemon=True).start()
-    threading.Thread(target=start_web_ui, daemon=True).start()
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    cached_markets = exchange.load_markets()
-    get_top_gate_perp_symbols(cached_markets, force_refresh=True)
-    state = load_state()
-    init_slots, init_cap = get_runtime_capacity_params(state)
+    threading.Thread(
+        target=_run_supervised,
+        args=("telegram_command_worker", telegram_command_worker),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_run_supervised,
+        args=("pinned_card_worker", pinned_card_worker),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_run_supervised,
+        args=("web_ui", start_web_ui),
+        daemon=True,
+    ).start()
+
+    while not stop_event.is_set():
+        try:
+            cached_markets = exchange.load_markets()
+            get_top_gate_perp_symbols(cached_markets, force_refresh=True)
+            break
+        except Exception as e:
+            logging.warning(f"Initial market load failed ({e}); retrying in {SUPERVISOR_RESTART_DELAY_SEC}s...")
+            _sleep_interruptible(SUPERVISOR_RESTART_DELAY_SEC)
+
+    if stop_event.is_set():
+        return
+
+    with state_lock:
+        state = load_state()
+        init_slots, init_cap = get_runtime_capacity_params(state)
 
     send_telegram(
         f"<b>ATR Top-{TOP_N_COINS} Bot Started [{mode_label()}]</b>\n"
@@ -1898,10 +2098,16 @@ def run_bot():
     ensure_and_update_pinned_card(force_new=False)
     logging.info(f"ATR Top-{TOP_N_COINS} Bot started in {mode_label()} mode on port {WEB_UI_PORT}.")
 
-    while True:
-        perform_scan_cycle(cached_markets)
-        time.sleep(POLL_INTERVAL_SEC)
+    while not stop_event.is_set():
+        try:
+            perform_scan_cycle(cached_markets)
+        except Exception as e:
+            logging.error(f"Top-level scan cycle failure: {e}")
+        _sleep_interruptible(POLL_INTERVAL_SEC)
+
+    logging.info("ATR Top-100 Bot stopped cleanly.")
 
 
 if __name__ == "__main__":
     run_bot()
+    sys.exit(0)
